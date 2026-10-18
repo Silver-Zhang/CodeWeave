@@ -11,14 +11,14 @@ from codeweave.index import IndexError, build_index, query
 
 
 ROOT = Path(__file__).resolve().parents[2]
-ANALYZER = ROOT / ".build" / "analyzer" / "codeweave-analyzer"
+ANALYZER = Path(os.environ.get("CODEWEAVE_ANALYZER", ROOT / ".build" / "analyzer" / "codeweave-analyzer"))
 
 
 class M0CorrectionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not ANALYZER.is_file():
-            raise unittest.SkipTest("run the M0 acceptance build first")
+            raise RuntimeError("run the M0 acceptance build first")
 
     def setUp(self):
         self.temp = Path(tempfile.mkdtemp(prefix="codeweave-m0r-"))
@@ -39,7 +39,7 @@ class M0CorrectionTest(unittest.TestCase):
         return self.project
 
     def test_safe_index_and_header_definition(self):
-        result = build_index(self.database, self.build, ANALYZER)
+        result = build_index(self.database, self.build, ANALYZER, self.project)
         self.assertEqual(result["coverage"], "units_complete")
         later = query(self.database, "search", "later")["items"][0]
         self.assertTrue(later["definition_file"].endswith("other.cpp"))
@@ -53,14 +53,14 @@ class M0CorrectionTest(unittest.TestCase):
         commands[0]["arguments"] = commands[0]["command"].split() + ["-serialize-diagnostics", str(sentinel)] if "arguments" not in commands[0] else commands[0]["arguments"] + ["-serialize-diagnostics", str(sentinel)]
         (self.build / "compile_commands.json").write_text(json.dumps(commands), encoding="utf-8")
         with self.assertRaisesRegex(IndexError, "rejected compiler argument"):
-            build_index(self.database, self.build, ANALYZER)
+            build_index(self.database, self.build, ANALYZER, self.project)
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
 
     def test_line_directive_uses_physical_file(self):
         private = self.temp / "private.txt"
         private.write_text("PRIVATE_SENTINEL", encoding="utf-8")
         (self.project / "main.cpp").write_text(f'#line 1 "{private}"\nint physical() {{ return 0; }}\n', encoding="utf-8")
-        result = build_index(self.database, self.build, ANALYZER)
+        result = build_index(self.database, self.build, ANALYZER, self.project)
         symbol = query(self.database, "search", "physical")["items"][0]
         self.assertTrue(symbol["definition_file"].endswith("main.cpp"))
         with self.assertRaises(IndexError):
@@ -68,7 +68,7 @@ class M0CorrectionTest(unittest.TestCase):
         self.assertEqual(query(self.database, "status")["index_id"], result["index_id"])
 
     def test_cli_errors_are_json(self):
-        build_index(self.database, self.build, ANALYZER)
+        build_index(self.database, self.build, ANALYZER, self.project)
         completed = subprocess.run([sys.executable, "-m", "codeweave", "query", "show", "--database", str(self.database)], cwd=ROOT, text=True, capture_output=True, env={**os.environ, "PYTHONPATH": str(ROOT / "backend")})
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(completed.stdout, "")
@@ -78,7 +78,7 @@ class M0CorrectionTest(unittest.TestCase):
         commands = json.loads((self.build / "compile_commands.json").read_text())
         commands.append(commands[0])
         (self.build / "compile_commands.json").write_text(json.dumps(commands), encoding="utf-8")
-        build_index(self.database, self.build, ANALYZER)
+        build_index(self.database, self.build, ANALYZER, self.project)
         invoke = query(self.database, "search", "invoke")["items"][0]
         calls = query(self.database, "callees", invoke["usr"])["items"]
         self.assertEqual(len(calls), 2)

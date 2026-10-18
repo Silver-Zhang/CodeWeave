@@ -32,6 +32,10 @@ def main() -> None:
     index_parser.add_argument("--compilation-database", type=Path, required=True, help="Directory containing compile_commands.json")
     index_parser.add_argument("--database", type=Path, required=True, help="SQLite database path")
     index_parser.add_argument("--analyzer", type=Path, required=True, help="Built codeweave-analyzer executable")
+    index_parser.add_argument("--project-root", type=Path, required=True)
+    index_parser.add_argument("--dependency-root", type=Path, action="append", default=[])
+    index_parser.add_argument("--toolchain-root", type=Path, action="append", default=[])
+    index_parser.add_argument("--resource-dir", type=Path, help="Trusted Clang resource directory containing include/")
     query_parser = subparsers.add_parser("query", help="Query a persistent index", exit_on_error=False)
     query_parser.add_argument("query_command", choices=["status", "search", "show", "callers", "callees", "source"])
     query_parser.add_argument("value", nargs="?")
@@ -48,7 +52,7 @@ def main() -> None:
             import uvicorn
             uvicorn.run("codeweave.app:app", host="127.0.0.1", port=8000, reload=False)
         elif args.command == "index":
-            _json(build_index(args.database, args.compilation_database, args.analyzer))
+            _json(build_index(args.database, args.compilation_database, args.analyzer, args.project_root, args.dependency_root, args.toolchain_root, args.resource_dir))
         elif args.command == "query":
             _json(query(args.database, args.query_command, args.value, args.index_id, args.limit, args.start_line, args.end_line))
     except IndexError as error:

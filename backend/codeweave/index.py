@@ -1,10 +1,10 @@
-"""Versioned, sandboxed CodeWeave M0 SQLite index."""
+"""Versioned index. Untrusted compilation input runs only inside Bubblewrap."""
 from __future__ import annotations
-
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import sqlite3
@@ -12,292 +12,357 @@ import subprocess
 import tempfile
 import uuid
 
-SCHEMA_VERSION = 2
-FACT_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+FACT_SCHEMA_VERSION = 2
 MAX_SOURCE_LINES = 200
-MAX_SOURCE_BYTES = 32_768
-
+MAX_SOURCE_BYTES = 32_768  # Raw snapshot bytes, before JSON escaping.
+COVERAGE_LIMITS = ["explicit evaluated CallExpr only", "no implicit lifecycle or global initializer edges",
+                   "virtual dispatch is static, indirect targets unresolved", "no PCH/modules",
+                   "system inputs are hashed, not archived; full build reproducibility is not claimed"]
 
 class IndexError(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
 
-
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
+def _json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 def _resolve(path: Path) -> Path:
     try:
         return path.expanduser().resolve(strict=True)
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         raise IndexError("invalid_path", str(error)) from error
 
-
 def _inside(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
+    return path.is_relative_to(root)
 
+SCHEMA = """
+CREATE TABLE indexes (
+ id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ compilation_database TEXT NOT NULL, compilation_sha256 TEXT NOT NULL,
+ project_root TEXT NOT NULL, coverage TEXT NOT NULL, diagnostic TEXT NOT NULL,
+ schema_version INTEGER NOT NULL, toolchain TEXT NOT NULL);
+CREATE TABLE files (
+ index_id TEXT NOT NULL REFERENCES indexes(id), path TEXT NOT NULL, content BLOB,
+ sha256 TEXT NOT NULL, scope TEXT NOT NULL, PRIMARY KEY(index_id,path));
+CREATE TABLE units (
+ index_id TEXT NOT NULL REFERENCES indexes(id), source_file TEXT NOT NULL,
+ command_sha256 TEXT NOT NULL, status TEXT NOT NULL, diagnostics TEXT NOT NULL,
+ command TEXT NOT NULL, PRIMARY KEY(index_id,source_file));
+CREATE TABLE unit_files (
+ index_id TEXT NOT NULL, source_file TEXT NOT NULL, path TEXT NOT NULL,
+ PRIMARY KEY(index_id,source_file,path),
+ FOREIGN KEY(index_id,source_file) REFERENCES units(index_id,source_file),
+ FOREIGN KEY(index_id,path) REFERENCES files(index_id,path));
+CREATE TABLE symbols (
+ index_id TEXT NOT NULL REFERENCES indexes(id), usr TEXT NOT NULL, name TEXT NOT NULL,
+ kind TEXT NOT NULL, declaration_file TEXT NOT NULL, declaration_line INTEGER NOT NULL,
+ declaration_column INTEGER NOT NULL, definition_file TEXT, definition_line INTEGER,
+ definition_column INTEGER, anchors TEXT NOT NULL, PRIMARY KEY(index_id,usr),
+ FOREIGN KEY(index_id,declaration_file) REFERENCES files(index_id,path),
+ FOREIGN KEY(index_id,definition_file) REFERENCES files(index_id,path));
+CREATE TABLE symbol_units (
+ index_id TEXT NOT NULL, usr TEXT NOT NULL, source_file TEXT NOT NULL,
+ PRIMARY KEY(index_id,usr,source_file),
+ FOREIGN KEY(index_id,usr) REFERENCES symbols(index_id,usr),
+ FOREIGN KEY(index_id,source_file) REFERENCES units(index_id,source_file));
+CREATE TABLE calls (
+ id INTEGER PRIMARY KEY, index_id TEXT NOT NULL REFERENCES indexes(id), instance_id TEXT NOT NULL,
+ caller_usr TEXT NOT NULL, target_usr TEXT, dispatch TEXT NOT NULL,
+ file TEXT NOT NULL, line INTEGER NOT NULL, column_number INTEGER NOT NULL, anchors TEXT NOT NULL,
+ UNIQUE(index_id,instance_id), FOREIGN KEY(index_id,caller_usr) REFERENCES symbols(index_id,usr),
+ FOREIGN KEY(index_id,file) REFERENCES files(index_id,path));
+CREATE TABLE call_units (
+ index_id TEXT NOT NULL, instance_id TEXT NOT NULL, source_file TEXT NOT NULL,
+ PRIMARY KEY(index_id,instance_id,source_file),
+ FOREIGN KEY(index_id,instance_id) REFERENCES calls(index_id,instance_id),
+ FOREIGN KEY(index_id,source_file) REFERENCES units(index_id,source_file));
+CREATE INDEX calls_by_caller ON calls(index_id,caller_usr);
+CREATE INDEX calls_by_target ON calls(index_id,target_usr);
+PRAGMA user_version = 3;
+"""
 
-def _connection(database: Path) -> sqlite3.Connection:
+def _connection(database: Path, readonly: bool = False) -> sqlite3.Connection:
     try:
-        connection = sqlite3.connect(database)
+        connection = sqlite3.connect(database.absolute().as_uri() + ("?mode=ro" if readonly else "?mode=rw"), uri=True)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA foreign_keys=ON")
         return connection
     except sqlite3.Error as error:
         raise IndexError("database_error", "cannot open index database") from error
 
+def _schema_identity(connection: sqlite3.Connection) -> list:
+    return [tuple(row) for row in connection.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")]
 
-def _init(connection: sqlite3.Connection) -> None:
-    version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, SCHEMA_VERSION):
-        raise IndexError("schema_incompatible", "database schema is incompatible; rebuild into a new database")
-    connection.executescript("""
-    CREATE TABLE IF NOT EXISTS indexes (
-      id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      compilation_database TEXT NOT NULL, compilation_sha256 TEXT NOT NULL,
-      project_root TEXT NOT NULL, coverage TEXT NOT NULL, diagnostic TEXT,
-      schema_version INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS files (
-      index_id TEXT NOT NULL REFERENCES indexes(id), path TEXT NOT NULL, content BLOB NOT NULL,
-      sha256 TEXT NOT NULL, PRIMARY KEY (index_id, path)
-    );
-    CREATE TABLE IF NOT EXISTS symbols (
-      index_id TEXT NOT NULL REFERENCES indexes(id), usr TEXT NOT NULL, name TEXT NOT NULL,
-      kind TEXT NOT NULL, declaration_file TEXT NOT NULL, declaration_line INTEGER NOT NULL,
-      declaration_column INTEGER NOT NULL, definition_file TEXT, definition_line INTEGER,
-      definition_column INTEGER, PRIMARY KEY (index_id, usr)
-    );
-    CREATE TABLE IF NOT EXISTS calls (
-      id INTEGER PRIMARY KEY, index_id TEXT NOT NULL REFERENCES indexes(id), caller_usr TEXT,
-      target_usr TEXT, dispatch TEXT NOT NULL, file TEXT NOT NULL, line INTEGER NOT NULL,
-      column_number INTEGER NOT NULL, UNIQUE(index_id, caller_usr, target_usr, dispatch, file, line, column_number)
-    );
-    CREATE TABLE IF NOT EXISTS units (
-      index_id TEXT NOT NULL REFERENCES indexes(id), source_file TEXT NOT NULL,
-      command_sha256 TEXT NOT NULL, status TEXT NOT NULL, diagnostics TEXT NOT NULL,
-      PRIMARY KEY(index_id, source_file, command_sha256)
-    );
-    CREATE INDEX IF NOT EXISTS calls_by_caller ON calls(index_id, caller_usr);
-    CREATE INDEX IF NOT EXISTS calls_by_target ON calls(index_id, target_usr);
-    PRAGMA user_version = 2;
-    """)
-
-
-def _arguments(entry: dict[str, object]) -> list[str]:
-    if isinstance(entry.get("arguments"), list) and all(isinstance(arg, str) for arg in entry["arguments"]):
-        return list(entry["arguments"])
-    if isinstance(entry.get("command"), str):
-        try:
-            return shlex.split(entry["command"], posix=True)
-        except ValueError as error:
-            raise IndexError("invalid_compilation_database", "invalid command quoting") from error
-    raise IndexError("invalid_compilation_database", "compile command has no arguments")
-
-
-def _safe_arguments(arguments: list[str], source: Path, directory: Path) -> list[str]:
-    if not arguments:
-        raise IndexError("invalid_compilation_database", "empty compiler command")
-    compiler = Path(arguments[0]).name
-    if compiler not in {"c++", "g++", "clang++", "clang"}:
-        raise IndexError("unsafe_compilation_argument", "compiler executable is not allowed")
-    safe = [arguments[0]]
-    value_flags = {"-I", "-isystem", "-iquote", "-include", "-imacros", "-D", "-U", "-std", "-x", "-target", "--target"}
-    rejected = {"-MF", "-MT", "-MQ", "-MJ", "-serialize-diagnostics", "-fmodule-cache-path", "-Xclang", "-Xassembler", "-Xlinker", "-load", "-plugin"}
-    index = 1
-    while index < len(arguments):
-        arg = arguments[index]
-        if arg.startswith("@") or arg in rejected or arg.startswith("-fmodules") or arg.startswith("-plugin"):
-            raise IndexError("unsafe_compilation_argument", f"rejected compiler argument: {arg}")
-        if arg == "-o":
-            if index + 1 >= len(arguments):
-                raise IndexError("invalid_compilation_database", "output flag lacks value")
-            index += 2
-            continue
-            index += 1
-            continue
-        if arg in {"-c", str(source), source.name}:
-            index += 1
-            continue
-        if arg in value_flags:
-            if index + 1 >= len(arguments):
-                raise IndexError("invalid_compilation_database", f"compiler flag lacks value: {arg}")
-            value = arguments[index + 1]
-            if arg in {"-I", "-isystem", "-iquote", "-include", "-imacros"} and not Path(value).is_absolute():
-                value = str((directory / value).resolve())
-            safe.extend([arg, value])
-            index += 2
-            continue
-        if arg.startswith(("-I", "-D", "-U", "-std=", "--target=", "-O", "-W", "-fno-", "-m")) or arg in {"-g", "-pthread", "-fPIC", "-pipe"}:
-            safe.append(arg)
-            index += 1
-            continue
-        if arg.startswith("-"):
-            raise IndexError("unsafe_compilation_argument", f"unsupported compiler argument: {arg}")
-        if Path(arg).resolve() != source:
-            raise IndexError("unsafe_compilation_argument", f"unexpected positional argument: {arg}")
-        index += 1
-    safe.extend(["-c", str(source)])
-    return safe
-
-
-def _load_compilation_database(directory: Path) -> tuple[list[dict[str, object]], Path, bytes]:
-    directory = _resolve(directory)
-    path = directory / "compile_commands.json"
-    if not path.is_file():
-        raise IndexError("missing_compilation_database", f"missing compilation database: {path}")
+def _validate_schema(connection: sqlite3.Connection) -> None:
+    expected = sqlite3.connect(":memory:")
     try:
-        raw = path.read_bytes()
-        commands = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise IndexError("invalid_compilation_database", "compile_commands.json is invalid UTF-8 JSON") from error
-    if not isinstance(commands, list) or not commands:
-        raise IndexError("invalid_compilation_database", "compilation database has no commands")
-    normalized: list[dict[str, object]] = []
-    sources: list[Path] = []
-    seen: set[tuple[str, str]] = set()
-    for entry in commands:
-        if not isinstance(entry, dict) or not isinstance(entry.get("file"), str):
-            raise IndexError("invalid_compilation_database", "compile command lacks file")
-        command_directory = _resolve(Path(str(entry.get("directory", directory))))
-        source = Path(entry["file"])
-        source = _resolve(source if source.is_absolute() else command_directory / source)
-        if not source.is_file():
-            raise IndexError("missing_input", f"compilation input is unavailable: {source}")
-        arguments = _safe_arguments(_arguments(entry), source, command_directory)
-        digest = _sha256(json.dumps(arguments, separators=(",", ":")).encode())
-        key = (str(source), digest)
-        if key in seen:
+        expected.executescript(SCHEMA)
+        if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION or _schema_identity(connection) != _schema_identity(expected):
+            raise IndexError("schema_incompatible", "database schema is incompatible; rebuild into a new database path")
+    finally:
+        expected.close()
+
+def _arguments(entry: dict) -> list[str]:
+    args = entry.get("arguments")
+    if isinstance(args, list) and args and all(isinstance(x, str) for x in args):
+        return args
+    if isinstance(entry.get("command"), str):
+        return shlex.split(entry["command"])
+    raise IndexError("invalid_compilation_database", "compile command lacks arguments")
+
+def _trusted_root(path: Path) -> Path:
+    root = _resolve(path)
+    if not root.is_dir() or root in {Path("/"), Path("/home"), Path.home(), Path("/tmp")}:
+        raise IndexError("invalid_project_root", "authorize a specific project/dependency directory, not a host-wide root")
+    return root
+
+def _safe_arguments(arguments: list[str], source: Path, directory: Path, roots: list[Path]) -> list[str]:
+    if not arguments or Path(arguments[0]).name not in {"c++", "g++", "clang++", "clang"}:
+        raise IndexError("unsafe_compilation_argument", "compiler executable is not supported")
+    # The compiler spelling selects a driver language, never an executable/mount.
+    safe = ["/usr/bin/clang++" if "++" in arguments[0] else "/usr/bin/clang"]
+    paths = {"-I", "-isystem", "-iquote", "-include", "-imacros"}
+    values = {"-D", "-U", "-std", "-x", "-target", "--target"}
+    def authorized(value: str) -> str:
+        candidate = Path(value)
+        physical = (candidate if candidate.is_absolute() else directory / candidate).resolve()
+        if not any(_inside(physical, root) for root in roots):
+            raise IndexError("outside_authorized_roots", "compiler path is outside authorized roots")
+        return str(physical)
+    i = 1
+    while i < len(arguments):
+        arg = arguments[i]
+        if arg == "-o":
+            if i + 1 >= len(arguments):
+                raise IndexError("invalid_compilation_database", "output flag lacks value")
+            i += 2
             continue
-        seen.add(key)
-        sources.append(source)
-        normalized.append({"directory": str(command_directory), "file": str(source), "arguments": arguments, "command_sha256": digest})
-    root = Path(os.path.commonpath([str(source.parent) for source in sources])).resolve()
-    if not root.is_dir():
-        raise IndexError("invalid_compilation_database", "cannot determine project root")
-    return normalized, root, raw
+        if arg == "-c":
+            i += 1
+            continue
+        if arg in paths | values:
+            if i + 1 >= len(arguments):
+                raise IndexError("invalid_compilation_database", "compiler flag lacks value")
+            val = arguments[i + 1]
+            safe.extend([arg, authorized(val) if arg in paths else val])
+            i += 2
+            continue
+        joined = next((flag for flag in sorted(paths, key=len, reverse=True) if arg.startswith(flag) and arg != flag), None)
+        if joined:
+            safe.extend([joined, authorized(arg[len(joined):])])
+        elif arg.startswith(("-D", "-U", "-std=", "--target=")):
+            safe.append(arg)
+        elif re.fullmatch(r"-O[0-3sgz]?|-W(?:no-)?[a-zA-Z0-9_-]+(?:=[a-zA-Z0-9_-]+)?|-m[a-zA-Z0-9_=+.-]+", arg):
+            safe.append(arg)
+        elif arg in {"-g", "-pthread", "-fPIC", "-fPIE", "-pipe", "-fno-exceptions", "-fno-rtti", "-fexceptions", "-frtti"}:
+            safe.append(arg)
+        elif not arg.startswith(("-", "@")) and (directory / arg).resolve() == source:
+            pass
+        else:
+            raise IndexError("unsafe_compilation_argument", f"rejected compiler argument: {arg}")
+        i += 1
+    return safe + ["-c", str(source)]
 
+def _load_compilation_database(directory: Path, project_root: Path, roots: list[Path], toolchain: dict) -> tuple[list[dict], bytes]:
+    directory = _resolve(directory)
+    try:
+        raw = (directory / "compile_commands.json").read_bytes()
+        entries = json.loads(raw)
+    except (OSError, ValueError) as error:
+        raise IndexError("invalid_compilation_database", "cannot read UTF-8 compile_commands.json") from error
+    if not isinstance(entries, list) or not entries:
+        raise IndexError("invalid_compilation_database", "compilation database has no commands")
+    commands = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("file"), str) or not isinstance(entry.get("directory"), str):
+            raise IndexError("invalid_compilation_database", "command requires file and directory strings")
+        cwd = Path(entry["directory"])
+        if not cwd.is_absolute():
+            raise IndexError("invalid_compilation_database", "command directory must be absolute")
+        cwd = _resolve(cwd)
+        source = _resolve(cwd / entry["file"])
+        if not source.is_file() or not _inside(source, project_root):
+            raise IndexError("outside_project_root", "translation unit is outside authorized project root")
+        args = _safe_arguments(_arguments(entry), source, cwd, roots)
+        command = {"directory": str(cwd), "file": str(source), "arguments": args}
+        digest = _sha256(_json({**command, "toolchain": toolchain}).encode())
+        if str(source) in commands and commands[str(source)]["command_sha256"] != digest:
+            raise IndexError("multiple_configurations", "select one compilation configuration per translation unit")
+        commands[str(source)] = {**command, "command_sha256": digest}
+    return list(commands.values()), raw
 
-def _sandbox_command(analyzer: Path, database_directory: Path, facts: Path, project_root: Path, allowed_directories: set[Path]) -> list[str]:
+def _sandbox_command(analyzer: Path, database_directory: Path, facts: Path, project_root: Path, roots: list[Path], directories: set[Path]) -> list[str]:
     bwrap = shutil.which("bwrap")
     if not bwrap:
-        raise IndexError("sandbox_unavailable", "bubblewrap is required for untrusted compilation databases")
-    mounts = ["--die-with-parent", "--unshare-net", "--new-session", "--proc", "/proc", "--dev", "/dev"]
-    for root in (Path("/usr"), Path("/lib"), Path("/lib64"), analyzer.parent, database_directory, project_root, *allowed_directories):
+        raise IndexError("sandbox_unavailable", "bubblewrap is required; no unisolated fallback")
+    args = [bwrap, "--die-with-parent", "--unshare-all", "--new-session", "--clearenv",
+            "--setenv", "PATH", "/usr/bin:/bin", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    for root in dict.fromkeys([Path("/usr"), Path("/lib"), Path("/lib64"), *roots, database_directory]):
         if root.exists():
-            mounts.extend(["--ro-bind", str(root), str(root)])
+            args += ["--ro-bind", str(root), str(root)]
+    args += ["--ro-bind", str(analyzer), str(analyzer)]
+    # cwd affects option resolution only. Empty directories confer no host access.
+    for cwd in sorted(directories):
+        args += ["--dir", str(cwd)]
     facts.parent.mkdir(parents=True, exist_ok=True)
-    mounts.extend(["--bind", str(facts.parent), str(facts.parent)])
-    return [bwrap, *mounts, str(analyzer), "--compilation-database", str(database_directory), "--output", str(facts), "--project-root", str(project_root)]
+    args += ["--bind", str(facts.parent), str(facts.parent), "--chdir", str(project_root)]
+    return args + [str(analyzer), "--compilation-database", str(database_directory), "--output", str(facts), "--project-root", str(project_root)]
 
+def _collect(records: list, commands: list[dict], project_root: Path) -> tuple:
+    tus = {c["file"] for c in commands}
+    files, units, merged, calls = {}, {}, {}, {}
+    file_units, symbol_units, call_units = set(), set(), set()
+    for r in records:
+        if not isinstance(r, dict) or r.get("schema") != FACT_SCHEMA_VERSION or r.get("tu") not in tus or r.get("type") not in {"file", "unit", "entity", "call"}:
+            raise IndexError("invalid_facts", "unsupported fact version, type or translation unit")
+        if r["type"] == "file":
+            path, digest = r["path"], r["sha256"]
+            if not Path(path).is_absolute() or str(Path(path)) != path or ".." in Path(path).parts:
+                raise IndexError("invalid_facts", "noncanonical physical path")
+            project = _inside(Path(path), project_root)
+            content = bytes.fromhex(r["content_hex"]) if r["content_hex"] is not None else None
+            if not re.fullmatch('[0-9a-f]{64}', digest) or (content is not None and _sha256(content) != digest) or project != (content is not None):
+                raise IndexError("invalid_facts", "invalid buffer identity or scope")
+            value = (content, digest, "project" if project else "dependency")
+            if path in files and files[path] != value:
+                raise IndexError("inconsistent_input", "translation units observed different versions of one input")
+            files[path] = value
+            file_units.add((r["tu"], path))
+        elif r["type"] == "unit":
+            if r["tu"] in units or r.get("status") != "complete" or not isinstance(r.get("diagnostics"), list) or any(not isinstance(d, dict) or d.get("level") not in {"note", "warning"} or not isinstance(d.get("message"), str) for d in r["diagnostics"]):
+                raise IndexError("analysis_failed", "unit failed or has invalid diagnostics")
+            units[r["tu"]] = r
+    if set(units) != tus or not all((tu, tu) in file_units for tu in tus):
+        raise IndexError("incomplete_analysis", "missing unit results or source buffers")
+    def anchor(loc: dict, tu: str) -> None:
+        if not isinstance(loc, dict) or loc.get("file") not in files or (tu, loc["file"]) not in file_units:
+            raise IndexError("invalid_facts", "anchor lacks a unit buffer")
+        content, digest, _ = files[loc["file"]]
+        if loc.get("sha256") != digest or not all(type(loc.get(k)) is int and loc[k] >= (0 if k == "offset" else 1) for k in ("line", "column", "offset")):
+            raise IndexError("invalid_facts", "anchor identity is invalid")
+        if content is not None:
+            offset = loc["offset"]
+            prefix = content[:offset]
+            if offset > len(content) or prefix.count(b"\n") + 1 != loc["line"] or len(prefix.rsplit(b"\n", 1)[-1]) + 1 != loc["column"]:
+                raise IndexError("invalid_facts", "anchor disagrees with source bytes")
+    for r in records:
+        if r["type"] == "entity":
+            if not all(isinstance(r.get(k), str) and r[k] for k in ("usr", "name", "kind")):
+                raise IndexError("invalid_facts", "invalid entity")
+            anchor(r["declaration"], r["tu"])
+            if r.get("definition"):
+                anchor(r["definition"], r["tu"])
+            prior = merged.get(r["usr"])
+            if prior and prior.get("definition") and r.get("definition") and (prior["definition"] != r["definition"] or prior.get("definition_odr") != r.get("definition_odr")):
+                raise IndexError("conflicting_definition", "incompatible definitions for one entity")
+            if not prior or (not prior.get("definition") and r.get("definition")):
+                merged[r["usr"]] = r
+            symbol_units.add((r["usr"], r["tu"]))
+        elif r["type"] == "call":
+            anchor(r["location"], r["tu"])
+            anchor(r["spelling"], r["tu"])
+            for pair in r["expansion_chain"]:
+                for loc in pair:
+                    anchor(loc, r["tu"])
+            if r.get("dispatch") not in {"direct", "virtual", "unknown-function-pointer", "unknown-dependent"} or not isinstance(r.get("caller_usr"), str) or not (r.get("target_usr") is None or isinstance(r["target_usr"], str)):
+                raise IndexError("invalid_facts", "invalid call")
+            identity = {key: r[key] for key in ("caller_usr", "target_usr", "dispatch", "location", "spelling", "expansion_chain")}
+            key = _sha256(_json(identity).encode())
+            calls[key] = r
+            call_units.add((key, r["tu"]))
+    if not merged:
+        raise IndexError("empty_analysis", "analysis produced no entities")
+    if any(c["caller_usr"] not in merged for c in calls.values()):
+        raise IndexError("invalid_facts", "call has no caller entity")
+    return files, units, merged, calls, file_units, symbol_units, call_units
 
-def _validate_fact(record: object, project_root: Path) -> dict[str, object]:
-    if not isinstance(record, dict) or record.get("schema") != FACT_SCHEMA_VERSION or record.get("type") not in {"entity", "call", "file"}:
-        raise IndexError("invalid_facts", "analyzer returned an unsupported fact record")
-    if record["type"] == "file":
-        path = record.get("path")
-        if not isinstance(path, str) or not isinstance(record.get("content"), str):
-            raise IndexError("invalid_facts", "file fact lacks a physical buffer")
-        resolved = _resolve(Path(path))
-        if not _inside(resolved, project_root):
-            raise IndexError("outside_project_root", "analyzer fact references a file outside the project root")
-        record["path"] = str(resolved)
-        return record
-    for key in ("declaration", "definition") if record["type"] == "entity" else ("location",):
-        location = record.get(key)
-        if location is None and key == "definition":
-            continue
-        if not isinstance(location, dict) or not isinstance(location.get("file"), str):
-            raise IndexError("invalid_facts", "fact lacks a physical source location")
-        path = _resolve(Path(location["file"]))
-        if not _inside(path, project_root):
-            raise IndexError("outside_project_root", "analyzer fact references a file outside the project root")
-        location["file"] = str(path)
-    return record
-
-
-def build_index(database: Path, compilation_database: Path, analyzer: Path) -> dict[str, object]:
+def build_index(database: Path, compilation_database: Path, analyzer: Path, project_root: Path,
+                dependency_roots: list[Path] | None = None, toolchain_roots: list[Path] | None = None, resource_directory: Path | None = None) -> dict:
+    if database.exists():
+        existing = _connection(database, readonly=True)
+        try:
+            _validate_schema(existing)
+        except sqlite3.Error as error:
+            raise IndexError("database_error", "cannot validate index database") from error
+        finally:
+            existing.close()
+    project_root = _trusted_root(project_root)
+    deps = [_trusted_root(p) for p in dependency_roots or []]
+    tool_roots = [_trusted_root(p) for p in toolchain_roots or []]
+    resource = _trusted_root(resource_directory) if resource_directory else None
+    if resource:
+        tool_roots.append(resource)
     analyzer = _resolve(analyzer)
     if not analyzer.is_file() or not os.access(analyzer, os.X_OK):
         raise IndexError("analyzer_unavailable", "analyzer is not executable")
-    commands, project_root, raw_database = _load_compilation_database(compilation_database)
-    allowed_directories = {Path(command["directory"]) for command in commands}
-    with tempfile.TemporaryDirectory(prefix="codeweave-index-") as temporary:
-        staging = Path(temporary)
-        sanitized_directory = staging / "compilation"
-        sanitized_directory.mkdir()
-        sanitized_commands = [{"directory": command["directory"], "file": command["file"], "arguments": command["arguments"]} for command in commands]
-        (sanitized_directory / "compile_commands.json").write_text(json.dumps(sanitized_commands), encoding="utf-8")
-        facts = staging / "output" / "facts.jsonl"
-        result = subprocess.run(_sandbox_command(analyzer, sanitized_directory, facts, project_root, allowed_directories), text=True, capture_output=True, check=False)
+    toolchain = {"analyzer_sha256": _sha256(analyzer.read_bytes()), "protocol": FACT_SCHEMA_VERSION,
+                 "toolchain_roots": list(map(str, tool_roots)), "dependency_roots": list(map(str, deps)),
+                 "system_roots": ["/usr", "/lib", "/lib64"]}
+    commands, raw = _load_compilation_database(compilation_database, project_root, [project_root, *deps, *tool_roots, Path("/usr")], toolchain)
+    if resource:
+        for command in commands:
+            command["arguments"] += ["-resource-dir", str(resource)]
+            command["command_sha256"] = _sha256(_json({k: v for k, v in command.items() if k != "command_sha256"}).encode() + _json(toolchain).encode())
+    with tempfile.TemporaryDirectory(prefix="codeweave-index-") as temp:
+        stage = Path(temp)
+        ccdb = stage / "compilation"
+        ccdb.mkdir()
+        (ccdb / "compile_commands.json").write_text(_json([{k: c[k] for k in ("directory", "file", "arguments")} for c in commands]))
+        facts = stage / "output" / "facts.jsonl"
+        result = subprocess.run(_sandbox_command(analyzer, ccdb, facts, project_root, [project_root, *deps, *tool_roots], {Path(c["directory"]) for c in commands}), text=True, capture_output=True, check=False)
         if result.returncode:
-            message = result.stderr.strip() or "sandboxed analyzer failed"
-            raise IndexError("analysis_failed", message)
+            raise IndexError("analysis_failed", result.stderr.strip() or "isolated analyzer failed")
         try:
-            analyzer_stderr = result.stderr.strip()
-            records = [_validate_fact(json.loads(line), project_root) for line in facts.read_text(encoding="utf-8").splitlines() if line]
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, IndexError) as error:
-            if isinstance(error, IndexError):
-                raise
-            raise IndexError("invalid_facts", "analyzer produced invalid facts") from error
-    entities = [record for record in records if record["type"] == "entity"]
-    file_facts = {record["path"]: record["content"].encode("utf-8") for record in records if record["type"] == "file"}
-    if not entities:
-        raise IndexError("empty_analysis", "analysis produced no entities; previous index remains unchanged")
-    snapshot_paths = {Path(command["file"]) for command in commands}
-    for record in records:
-        for location in (record.get("declaration"), record.get("definition"), record.get("location")):
-            if location:
-                snapshot_paths.add(Path(location["file"]))
-    snapshots: dict[str, bytes] = {}
-    for path in snapshot_paths:
-        resolved = _resolve(path)
-        if not _inside(resolved, project_root):
-            raise IndexError("outside_project_root", "snapshot file escapes project root")
-        content = file_facts.get(str(resolved))
-        if content is None:
-            raise IndexError("incomplete_snapshot", f"analyzer did not provide parsed buffer: {resolved}")
-        snapshots[str(resolved)] = content
+            records = [json.loads(line) for line in facts.read_text().splitlines() if line]
+            collected = _collect(records, commands, project_root)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise IndexError("invalid_facts", "analyzer returned malformed facts") from error
+    files, units, merged, calls, file_units, symbol_units, call_units = collected
     index_id = str(uuid.uuid4())
     database.parent.mkdir(parents=True, exist_ok=True)
-    connection = _connection(database)
+    new = not database.exists()
+    temporary = None
+    connection = None
     try:
-        _init(connection)
+        if new:
+            fd, path = tempfile.mkstemp(prefix=".codeweave-", dir=database.parent)
+            os.close(fd)
+            temporary = Path(path)
+            connection = _connection(temporary)
+            connection.executescript(SCHEMA)
+        else:
+            connection = _connection(database)
+            _validate_schema(connection)
         with connection:
-            connection.execute("INSERT INTO indexes VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?)",
-                               (index_id, str(_resolve(compilation_database)), _sha256(raw_database), str(project_root), "units_complete", analyzer_stderr, SCHEMA_VERSION))
-            for path, content in snapshots.items():
-                connection.execute("INSERT INTO files VALUES (?, ?, ?, ?)", (index_id, path, content, _sha256(content)))
-            merged: dict[str, dict[str, object]] = {}
-            for record in entities:
-                prior = merged.get(record["usr"])
-                if prior and prior.get("definition") and record.get("definition") and prior["definition"] != record["definition"]:
-                    raise IndexError("conflicting_definition", f"conflicting definitions for {record['name']}")
-                if not prior or (not prior.get("definition") and record.get("definition")):
-                    merged[record["usr"]] = record
-            for record in merged.values():
-                declaration, definition = record["declaration"], record.get("definition")
-                connection.execute("INSERT INTO symbols VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (index_id, record["usr"], record["name"], record["kind"], declaration["file"], declaration["line"], declaration["column"], *(None if not definition else definition["file"], None if not definition else definition["line"], None if not definition else definition["column"])))
-            for record in records:
-                if record["type"] == "call":
-                    location = record["location"]
-                    connection.execute("INSERT OR IGNORE INTO calls(index_id, caller_usr, target_usr, dispatch, file, line, column_number) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (index_id, record.get("caller_usr"), record.get("target_usr"), record["dispatch"], location["file"], location["line"], location["column"]))
-            for command in commands:
-                connection.execute("INSERT INTO units VALUES (?, ?, ?, ?, ?)", (index_id, command["file"], command["command_sha256"], "complete", "[]"))
+            connection.execute("INSERT INTO indexes VALUES (?,CURRENT_TIMESTAMP,?,?,?,?,?,?,?)", (index_id, str(_resolve(compilation_database)), _sha256(raw), str(project_root), "units_complete", result.stderr, SCHEMA_VERSION, _json(toolchain)))
+            connection.executemany("INSERT INTO files VALUES (?,?,?,?,?)", [(index_id, path, *value) for path, value in files.items()])
+            connection.executemany("INSERT INTO units VALUES (?,?,?,?,?,?)", [(index_id, c["file"], c["command_sha256"], units[c["file"]]["status"], _json(units[c["file"]]["diagnostics"]), _json({**c, "clang_version": units[c["file"]].get("clang_version")})) for c in commands])
+            connection.executemany("INSERT INTO unit_files VALUES (?,?,?)", [(index_id, *row) for row in sorted(file_units)])
+            for r in merged.values():
+                d, f = r["declaration"], r.get("definition")
+                connection.execute("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?,?,?)", (index_id, r["usr"], r["name"], r["kind"], d["file"], d["line"], d["column"], *(f[k] if f else None for k in ("file", "line", "column")), _json({"declaration": d, "definition": f, "definition_odr": r.get("definition_odr")})))
+            connection.executemany("INSERT INTO symbol_units VALUES (?,?,?)", [(index_id, *row) for row in sorted(symbol_units)])
+            for key, r in calls.items():
+                loc = r["location"]
+                connection.execute("INSERT INTO calls(index_id,instance_id,caller_usr,target_usr,dispatch,file,line,column_number,anchors) VALUES (?,?,?,?,?,?,?,?,?)", (index_id, key, r["caller_usr"], r["target_usr"], r["dispatch"], loc["file"], loc["line"], loc["column"], _json({k: r[k] for k in ("location", "spelling", "expansion_chain")})))
+            connection.executemany("INSERT INTO call_units VALUES (?,?,?)", [(index_id, *row) for row in sorted(call_units)])
+        connection.close()
+        connection = None
+        if temporary:
+            os.link(temporary, database)  # Atomic publication without overwriting an existing path.
     except sqlite3.Error as error:
         raise IndexError("database_error", "database transaction failed") from error
     finally:
-        connection.close()
-    return {"index_id": index_id, "coverage": "units_complete", "entities": len(merged), "calls": sum(record["type"] == "call" for record in records)}
-
+        if connection:
+            connection.close()
+        if temporary:
+            temporary.unlink(missing_ok=True)
+    return {"index_id": index_id, "coverage": "units_complete", "entities": len(merged), "calls": len(calls), "call_observations": sum(r["type"] == "call" for r in records), "units": len(units)}
 
 def _index(connection: sqlite3.Connection, index_id: str | None) -> str:
     row = connection.execute("SELECT id FROM indexes WHERE id = ?", (index_id,)).fetchone() if index_id else connection.execute("SELECT id FROM indexes ORDER BY rowid DESC LIMIT 1").fetchone()
@@ -313,13 +378,16 @@ def query(database: Path, command: str, value: str | None = None, index_id: str 
         raise IndexError("missing_argument", f"{command} requires a value")
     if not database.is_file():
         raise IndexError("database_not_found", "index database does not exist")
-    connection = _connection(database)
+    connection = _connection(database, readonly=True)
     try:
-        _init(connection)
+        _validate_schema(connection)
         active = _index(connection, index_id)
         if command == "status":
             row = connection.execute("SELECT * FROM indexes WHERE id = ?", (active,)).fetchone()
-            return {"index_id": active, "coverage": row["coverage"], "compilation_database": row["compilation_database"], "compilation_sha256": row["compilation_sha256"], "schema_version": row["schema_version"]}
+            return {"index_id": active, "coverage": row["coverage"], "compilation_database": row["compilation_database"], "compilation_sha256": row["compilation_sha256"], "schema_version": row["schema_version"], "project_root": row["project_root"],
+                    "toolchain": json.loads(row["toolchain"]), "limitations": COVERAGE_LIMITS,
+                    "units": [{**dict(unit), "diagnostics": json.loads(unit["diagnostics"]), "command": json.loads(unit["command"])} for unit in connection.execute("SELECT * FROM units WHERE index_id = ? ORDER BY source_file", (active,))],
+                    "inputs": [dict(item) for item in connection.execute("SELECT path, sha256, scope FROM files WHERE index_id = ? ORDER BY path", (active,))]}
         if command in {"show", "callers", "callees", "source"} and not value:
             raise IndexError("missing_argument", f"{command} requires a value")
         if command == "search":
@@ -335,7 +403,7 @@ def query(database: Path, command: str, value: str | None = None, index_id: str 
             if end_line - start_line + 1 > MAX_SOURCE_LINES:
                 raise IndexError("source_limit", f"source range exceeds {MAX_SOURCE_LINES} lines")
             row = connection.execute("SELECT content FROM files WHERE index_id = ? AND path = ?", (active, value)).fetchone()
-            if not row:
+            if not row or row["content"] is None:
                 raise IndexError("source_not_registered", "path is not registered in this index")
             lines = bytes(row["content"]).splitlines(keepends=True)
             if end_line > len(lines):
@@ -346,7 +414,16 @@ def query(database: Path, command: str, value: str | None = None, index_id: str 
             return {"index_id": active, "path": value, "start_line": start_line, "end_line": end_line, "content": content.decode("utf-8", errors="replace")}
         else:
             raise IndexError("unknown_query", "unknown query command")
-        return {"index_id": active, "items": [dict(row) for row in rows[:limit]], "truncated": len(rows) > limit}
+        items = [dict(row) for row in rows[:limit]]
+        if command in {"search", "show"}:
+            for item in items:
+                item["anchors"] = json.loads(item["anchors"])
+                item["units"] = [r[0] for r in connection.execute("SELECT source_file FROM symbol_units WHERE index_id=? AND usr=? ORDER BY source_file", (active, item["usr"]))]
+        if command in {"callers", "callees"}:
+            for item in items:
+                item["anchors"] = json.loads(item["anchors"])
+                item["units"] = [r[0] for r in connection.execute("SELECT source_file FROM call_units WHERE index_id=? AND instance_id=? ORDER BY source_file", (active, item["instance_id"]))]
+        return {"index_id": active, "items": items, "truncated": len(rows) > limit}
     except sqlite3.Error as error:
         raise IndexError("database_error", "database query failed") from error
     finally:

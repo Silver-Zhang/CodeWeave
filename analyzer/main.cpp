@@ -1,9 +1,14 @@
 #include <clang/AST/ASTConsumer.h>
+#include <clang/AST/ODRHash.h>
+#include <clang/Basic/Version.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Index/USRGeneration.h>
 #include <clang/Lex/Preprocessor.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/SHA256.h>
+#include <llvm/ADT/StringExtras.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
 #include <llvm/Support/CommandLine.h>
@@ -57,11 +62,13 @@ std::optional<std::string> usrFor(const clang::Decl *decl) {
   return std::string(usr.str());
 }
 
+std::string canonicalPath(llvm::StringRef path);
+
 std::string physicalPath(clang::SourceLocation location, clang::SourceManager &sourceManager) {
   const auto spelling = sourceManager.getSpellingLoc(location);
   const auto file = sourceManager.getFileLoc(spelling);
   const auto filename = sourceManager.getFilename(file);
-  return filename.empty() ? std::string() : std::string(filename);
+  return filename.empty() ? std::string() : canonicalPath(filename);
 }
 
 bool allowedPath(llvm::StringRef path) {
@@ -69,28 +76,29 @@ bool allowedPath(llvm::StringRef path) {
   return path == root || (path.starts_with(root) && path.size() > root.size() && path[root.size()] == '/');
 }
 
-bool safeCompileCommand(const clang::tooling::CompileCommand &command) {
-  for (size_t index = 0; index < command.CommandLine.size(); ++index) {
-    const auto &argument = command.CommandLine[index];
-    if (argument == "-o") {
-      if (++index >= command.CommandLine.size()) return false;
-      continue;
-    }
-    if (argument.empty() || argument.front() == '@' || argument == "-MF" ||
-        argument == "-MT" || argument == "-MQ" || argument == "-MJ" ||
-        argument == "-serialize-diagnostics" || argument == "-fmodule-cache-path" ||
-        argument == "-Xclang" || argument == "-Xassembler" || argument == "-Xlinker" ||
-        llvm::StringRef(argument).starts_with("-fmodules") || llvm::StringRef(argument).starts_with("-plugin")) {
-      return false;
-    }
-  }
-  return true;
+std::string digest(llvm::StringRef content) {
+  const auto hash = llvm::SHA256::hash(llvm::arrayRefFromStringRef(content));
+  return llvm::toHex(llvm::ArrayRef<uint8_t>(hash), true);
+}
+std::string currentTU;
+std::string canonicalPath(llvm::StringRef path) {
+  llvm::SmallString<256> real;
+  if (llvm::sys::fs::real_path(path, real)) return std::string(path);
+  return std::string(real.str());
 }
 
 std::string identityFor(const clang::FunctionDecl *decl, clang::SourceManager &sourceManager) {
   const auto usr = usrFor(decl).value_or(std::string());
-  if (!decl->hasExternalFormalLinkage()) {
-    return usr + "@" + physicalPath(decl->getLocation(), sourceManager);
+  bool localToTU = !decl->hasExternalFormalLinkage();
+  // A closure/local class inside an external inline function has the enclosing
+  // function's ODR identity, even though its method has no formal linkage.
+  for (const auto *context = decl->getDeclContext(); context; context = context->getParent()) {
+    if (const auto *enclosing = llvm::dyn_cast<clang::FunctionDecl>(context)) {
+      localToTU = !enclosing->hasExternalFormalLinkage();
+    }
+  }
+  if (localToTU) {
+    return usr + "@file=" + physicalPath(decl->getLocation(), sourceManager) + "@tu=" + currentTU;
   }
   return usr;
 }
@@ -100,8 +108,9 @@ public:
   explicit Emitter(std::ostream &out) : out_(out) {}
 
   void file(llvm::StringRef path, llvm::StringRef content) {
-    out_ << "{\"schema\":1,\"type\":\"file\",\"path\":" << quoted(path)
-         << ",\"content\":" << quoted(content) << "}\n";
+    out_ << "{\"schema\":2,\"type\":\"file\",\"tu\":" << quoted(currentTU)
+         << ",\"path\":" << quoted(path) << ",\"sha256\":" << quoted(digest(content))
+         << ",\"content_hex\":" << (allowedPath(path) ? quoted(llvm::toHex(content)) : "null") << "}\n";
   }
 
   void entity(const clang::FunctionDecl *decl, clang::SourceManager &sourceManager) {
@@ -112,7 +121,7 @@ public:
     const auto location = sourceManager.getSpellingLoc(canonical->getLocation());
     const auto file = physicalPath(location, sourceManager);
     if (file.empty() || !allowedPath(file)) return;
-    out_ << "{\"schema\":1,\"type\":\"entity\",\"usr\":" << quoted(identity)
+    out_ << "{\"schema\":2,\"type\":\"entity\",\"tu\":" << quoted(currentTU) << ",\"usr\":" << quoted(identity)
          << ",\"semantic_usr\":" << quoted(*usr)
          << ",\"name\":" << quoted(canonical->getQualifiedNameAsString())
          << ",\"kind\":" << quoted(canonical->isCXXClassMember() ? "method" : "function")
@@ -127,16 +136,23 @@ public:
     } else {
       out_ << "null";
     }
+    out_ << ",\"definition_odr\":";
+    if (const auto *definition = canonical->getDefinition()) {
+      clang::ODRHash hash;
+      hash.AddFunctionDecl(definition);
+      out_ << hash.CalculateHash();
+    } else out_ << "null";
     out_ << "}\n";
   }
 
   void call(const clang::CallExpr *call, const clang::FunctionDecl *caller,
             clang::SourceManager &sourceManager) {
-    const auto location = sourceManager.getSpellingLoc(call->getExprLoc());
+    const auto location = sourceManager.getExpansionLoc(call->getExprLoc());
     const auto physical = physicalPath(location, sourceManager);
     if (physical.empty() || !allowedPath(physical)) return;
     const clang::FunctionDecl *callee = call->getDirectCallee();
-    std::string dispatch = "unknown-function-pointer";
+    std::string dispatch = call->isTypeDependent() || call->isValueDependent()
+                               ? "unknown-dependent" : "unknown-function-pointer";
     if (callee) {
       dispatch = "direct";
       if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(callee)) {
@@ -146,11 +162,24 @@ public:
         }
       }
     }
-    out_ << "{\"schema\":1,\"type\":\"call\",\"caller_usr\":" << quoted(identityFor(caller, sourceManager));
+    out_ << "{\"schema\":2,\"type\":\"call\",\"tu\":" << quoted(currentTU) << ",\"caller_usr\":" << quoted(identityFor(caller, sourceManager));
     out_ << ",\"target_usr\":";
     if (callee) out_ << quoted(identityFor(callee, sourceManager)); else out_ << "null";
     out_ << ",\"dispatch\":" << quoted(dispatch)
-         << ",\"location\":" << locationJson(location, sourceManager) << "}\n";
+         << ",\"location\":" << locationJson(location, sourceManager)
+         << ",\"spelling\":" << locationJson(sourceManager.getSpellingLoc(call->getExprLoc()), sourceManager)
+         << ",\"expansion_chain\":[";
+    auto macro = call->getExprLoc();
+    bool first = true;
+    while (macro.isMacroID()) {
+      if (!first) out_ << ",";
+      first = false;
+      const auto range = sourceManager.getImmediateExpansionRange(macro);
+      out_ << "[" << locationJson(sourceManager.getSpellingLoc(range.getBegin()), sourceManager)
+           << "," << locationJson(sourceManager.getSpellingLoc(range.getEnd()), sourceManager) << "]";
+      macro = sourceManager.getImmediateMacroCallerLoc(macro);
+    }
+    out_ << "]}\n";
   }
 
 private:
@@ -163,7 +192,7 @@ private:
     const auto offset = sourceManager.getFileOffset(spelling);
     return "{\"file\":" + quoted(physicalPath(spelling, sourceManager)) + ",\"line\":" +
            std::to_string(invalid ? 0 : line) + ",\"column\":" +
-           std::to_string(invalid ? 0 : column) + ",\"offset\":" + std::to_string(offset) + "}";
+           std::to_string(invalid ? 0 : column) + ",\"offset\":" + std::to_string(offset) + ",\"sha256\":" + quoted(digest(sourceManager.getBufferData(sourceManager.getFileID(spelling)))) + "}";
   }
   std::ostream &out_;
 };
@@ -171,25 +200,23 @@ private:
 class Visitor : public clang::RecursiveASTVisitor<Visitor> {
 public:
   Visitor(clang::ASTContext &context, Emitter &emitter) : context_(context), emitter_(emitter) {}
-  bool TraverseFunctionDecl(clang::FunctionDecl *decl) {
-    functionStack_.push_back(decl);
-    const bool result = clang::RecursiveASTVisitor<Visitor>::TraverseFunctionDecl(decl);
-    functionStack_.pop_back();
+  // TraverseDecl is the common dispatch point for all FunctionDecl subclasses.
+  bool TraverseDecl(clang::Decl *decl) {
+    auto *function = llvm::dyn_cast_or_null<clang::FunctionDecl>(decl);
+    if (function) functionStack_.push_back(function);
+    const bool result = clang::RecursiveASTVisitor<Visitor>::TraverseDecl(decl);
+    if (function) functionStack_.pop_back();
     return result;
   }
-  bool TraverseUnaryExprOrTypeTraitExpr(clang::UnaryExprOrTypeTraitExpr *expr) {
-    if (expr->isArgumentType()) return true;
-    unevaluatedDepth_++;
-    const bool result = clang::RecursiveASTVisitor<Visitor>::TraverseUnaryExprOrTypeTraitExpr(expr);
-    unevaluatedDepth_--;
-    return result;
+  bool shouldVisitTemplateInstantiations() const { return true; }
+  bool TraverseLambdaExpr(clang::LambdaExpr *expr) {
+    for (auto *init : expr->capture_inits()) if (init && !TraverseStmt(init)) return false;
+    return TraverseDecl(expr->getCallOperator());
   }
-  bool TraverseCXXNoexceptExpr(clang::CXXNoexceptExpr *expr) {
-    unevaluatedDepth_++;
-    const bool result = clang::RecursiveASTVisitor<Visitor>::TraverseCXXNoexceptExpr(expr);
-    unevaluatedDepth_--;
-    return result;
-  }
+  bool TraverseUnaryExprOrTypeTraitExpr(clang::UnaryExprOrTypeTraitExpr *) { return true; }
+  bool TraverseCXXNoexceptExpr(clang::CXXNoexceptExpr *) { return true; }
+  bool TraverseDecltypeTypeLoc(clang::DecltypeTypeLoc) { return true; }
+  bool TraverseDecltypeType(clang::DecltypeType *) { return true; }
   bool VisitFunctionDecl(clang::FunctionDecl *decl) {
     const auto path = physicalPath(decl->getLocation(), context_.getSourceManager());
     if (!allowedPath(path)) return true;
@@ -197,10 +224,10 @@ public:
     return true;
   }
   bool VisitCallExpr(clang::CallExpr *call) {
-    if (unevaluatedDepth_ != 0) return true;
     const auto path = physicalPath(call->getExprLoc(), context_.getSourceManager());
     if (!allowedPath(path)) return true;
     if (!functionStack_.empty()) {
+      if (const auto *target = call->getDirectCallee()) emitter_.entity(target, context_.getSourceManager());
       emitter_.call(call, functionStack_.back(), context_.getSourceManager());
     }
     return true;
@@ -209,7 +236,6 @@ private:
   clang::ASTContext &context_;
   Emitter &emitter_;
   std::vector<const clang::FunctionDecl *> functionStack_;
-  unsigned unevaluatedDepth_ = 0;
 };
 
 class Consumer : public clang::ASTConsumer {
@@ -237,8 +263,7 @@ public:
       bool invalid = false;
       const auto content = sourceManager.getBufferData(file, &invalid);
       if (invalid) continue;
-      const auto path = it->first.getName();
-      if (!allowedPath(path)) continue;
+      const auto path = canonicalPath(it->first.getName());
       emitter_.file(path, content);
     }
   }
@@ -254,6 +279,22 @@ private:
   Emitter &emitter_;
 };
 
+class Diagnostics : public clang::DiagnosticConsumer {
+public:
+  bool failed = false;
+  std::vector<std::string> records;
+  void HandleDiagnostic(clang::DiagnosticsEngine::Level level, const clang::Diagnostic &info) override {
+    clang::DiagnosticConsumer::HandleDiagnostic(level, info);
+    llvm::SmallString<256> message;
+    info.FormatDiagnostic(message);
+    const bool error = level >= clang::DiagnosticsEngine::Error;
+    failed |= error;
+    const std::string severity = error ? "error" : level == clang::DiagnosticsEngine::Warning ? "warning" : "note";
+    records.push_back("{\"level\":" + quoted(severity) + ",\"message\":" + quoted(message) + "}");
+    llvm::errs() << severity << ": " << message << "\n";
+  }
+};
+
 } // namespace
 
 int main(int argc, const char **argv) {
@@ -265,24 +306,33 @@ int main(int argc, const char **argv) {
     llvm::errs() << "codeweave-analyzer: " << error << "\n";
     return 2;
   }
-  for (const auto &command : database->getAllCompileCommands()) {
-    if (!safeCompileCommand(command)) {
-      llvm::errs() << "codeweave-analyzer: rejected unsafe compilation argument\n";
-      return 2;
-    }
-  }
   std::ofstream output(OutputPath, std::ios::trunc);
   if (!output) {
     llvm::errs() << "codeweave-analyzer: cannot write output " << OutputPath << "\n";
     return 2;
   }
+  // Internal component: only the public Python entry point authorizes inputs and
+  // provides OS isolation. This executable must never be used on untrusted input.
   Emitter emitter(output);
-  clang::tooling::ClangTool tool(*database, database->getAllFiles());
-  Factory factory(emitter);
-  const int result = tool.run(&factory);
-  output.flush();
-  if (result != 0) {
-    llvm::errs() << "codeweave-analyzer: analysis failed; output must not be imported\n";
+  int result = 0;
+  for (const auto &file : database->getAllFiles()) {
+    currentTU = canonicalPath(file);
+    clang::tooling::ClangTool tool(*database, {file});
+    Diagnostics diagnostics;
+    tool.setDiagnosticConsumer(&diagnostics);
+    Factory factory(emitter);
+    const int unitResult = tool.run(&factory);
+    const bool failed = unitResult != 0 || diagnostics.failed;
+    result |= failed;
+    output << "{\"schema\":2,\"type\":\"unit\",\"tu\":" << quoted(currentTU)
+           << ",\"clang_version\":" << quoted(CLANG_VERSION_STRING)
+           << ",\"status\":" << quoted(failed ? "failed" : "complete") << ",\"diagnostics\":[";
+    for (size_t i = 0; i < diagnostics.records.size(); ++i) {
+      if (i) output << ",";
+      output << diagnostics.records[i];
+    }
+    output << "]}\n";
   }
-  return result;
+  output.flush();
+  return output ? result : 2;
 }

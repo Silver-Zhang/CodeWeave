@@ -18,9 +18,9 @@ FIXTURE = ROOT / "tests" / "fixtures" / "m0"
 class M0IndexTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.analyzer = ROOT / ".build" / "analyzer" / "codeweave-analyzer"
+        cls.analyzer = Path(os.environ.get("CODEWEAVE_ANALYZER", ROOT / ".build" / "analyzer" / "codeweave-analyzer"))
         if not cls.analyzer.exists():
-            raise unittest.SkipTest("build analyzer first")
+            raise RuntimeError("build analyzer first")
 
     def setUp(self):
         self.directory = Path(tempfile.mkdtemp(prefix="codeweave-m0-test-"))
@@ -29,7 +29,7 @@ class M0IndexTest(unittest.TestCase):
         self.build = self.directory / "build"
         subprocess.run(["cmake", "-S", str(self.source), "-B", str(self.build), "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"], check=True, capture_output=True, text=True)
         self.database = self.directory / "index.sqlite3"
-        self.result = build_index(self.database, self.build, self.analyzer)
+        self.result = build_index(self.database, self.build, self.analyzer, self.source)
 
     def tearDown(self):
         shutil.rmtree(self.directory)
@@ -73,7 +73,7 @@ class M0IndexTest(unittest.TestCase):
         with self.assertRaises(IndexError):
             query(self.database, "source", "/etc/passwd", start_line=1, end_line=1)
         with self.assertRaises(IndexError):
-            build_index(self.database, self.directory / "missing-build", self.analyzer)
+            build_index(self.database, self.directory / "missing-build", self.analyzer, self.source)
         self.assertEqual(query(self.database, "status")["index_id"], self.result["index_id"])
 
 

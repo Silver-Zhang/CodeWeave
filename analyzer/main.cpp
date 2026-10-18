@@ -3,6 +3,7 @@
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Index/USRGeneration.h>
+#include <clang/Lex/Preprocessor.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
 #include <llvm/Support/CommandLine.h>
@@ -11,7 +12,6 @@
 #include <cstdio>
 #include <fstream>
 #include <optional>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -23,6 +23,8 @@ llvm::cl::opt<std::string> CompilationDatabasePath(
     llvm::cl::Required, llvm::cl::cat(Category));
 llvm::cl::opt<std::string> OutputPath("output", llvm::cl::desc("JSONL output path"),
                                       llvm::cl::Required, llvm::cl::cat(Category));
+llvm::cl::opt<std::string> ProjectRoot("project-root", llvm::cl::desc("Allowed physical source root"),
+                                       llvm::cl::Required, llvm::cl::cat(Category));
 
 std::string escapeJson(llvm::StringRef value) {
   std::string out;
@@ -55,26 +57,70 @@ std::optional<std::string> usrFor(const clang::Decl *decl) {
   return std::string(usr.str());
 }
 
+std::string physicalPath(clang::SourceLocation location, clang::SourceManager &sourceManager) {
+  const auto spelling = sourceManager.getSpellingLoc(location);
+  const auto file = sourceManager.getFileLoc(spelling);
+  const auto filename = sourceManager.getFilename(file);
+  return filename.empty() ? std::string() : std::string(filename);
+}
+
+bool allowedPath(llvm::StringRef path) {
+  const std::string root = ProjectRoot;
+  return path == root || (path.starts_with(root) && path.size() > root.size() && path[root.size()] == '/');
+}
+
+bool safeCompileCommand(const clang::tooling::CompileCommand &command) {
+  for (size_t index = 0; index < command.CommandLine.size(); ++index) {
+    const auto &argument = command.CommandLine[index];
+    if (argument == "-o") {
+      if (++index >= command.CommandLine.size()) return false;
+      continue;
+    }
+    if (argument.empty() || argument.front() == '@' || argument == "-MF" ||
+        argument == "-MT" || argument == "-MQ" || argument == "-MJ" ||
+        argument == "-serialize-diagnostics" || argument == "-fmodule-cache-path" ||
+        argument == "-Xclang" || argument == "-Xassembler" || argument == "-Xlinker" ||
+        llvm::StringRef(argument).starts_with("-fmodules") || llvm::StringRef(argument).starts_with("-plugin")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string identityFor(const clang::FunctionDecl *decl, clang::SourceManager &sourceManager) {
+  const auto usr = usrFor(decl).value_or(std::string());
+  if (!decl->hasExternalFormalLinkage()) {
+    return usr + "@" + physicalPath(decl->getLocation(), sourceManager);
+  }
+  return usr;
+}
+
 class Emitter {
 public:
   explicit Emitter(std::ostream &out) : out_(out) {}
 
+  void file(llvm::StringRef path, llvm::StringRef content) {
+    out_ << "{\"schema\":1,\"type\":\"file\",\"path\":" << quoted(path)
+         << ",\"content\":" << quoted(content) << "}\n";
+  }
+
   void entity(const clang::FunctionDecl *decl, clang::SourceManager &sourceManager) {
-    auto usr = usrFor(decl);
-    if (!usr || !seen_.insert(*usr).second) return;
+    const auto usr = usrFor(decl);
+    if (!usr) return;
+    const auto identity = identityFor(decl, sourceManager);
     const auto canonical = decl->getCanonicalDecl();
-    const auto location = sourceManager.getExpansionLoc(canonical->getLocation());
-    const auto presumed = sourceManager.getPresumedLoc(location);
-    if (!presumed.isValid() || presumed.isInvalid()) return;
-    out_ << "{\"type\":\"entity\",\"usr\":" << quoted(*usr)
+    const auto location = sourceManager.getSpellingLoc(canonical->getLocation());
+    const auto file = physicalPath(location, sourceManager);
+    if (file.empty() || !allowedPath(file)) return;
+    out_ << "{\"schema\":1,\"type\":\"entity\",\"usr\":" << quoted(identity)
+         << ",\"semantic_usr\":" << quoted(*usr)
          << ",\"name\":" << quoted(canonical->getQualifiedNameAsString())
          << ",\"kind\":" << quoted(canonical->isCXXClassMember() ? "method" : "function")
-         << ",\"declaration\":" << locationJson(presumed) << ",\"definition\":";
+         << ",\"declaration\":" << locationJson(location, sourceManager) << ",\"definition\":";
     if (const auto *definition = canonical->getDefinition()) {
-      const auto definitionLocation = sourceManager.getExpansionLoc(definition->getLocation());
-      const auto definitionPresumed = sourceManager.getPresumedLoc(definitionLocation);
-      if (definitionPresumed.isValid() && !definitionPresumed.isInvalid()) {
-        out_ << locationJson(definitionPresumed);
+      const auto definitionLocation = sourceManager.getSpellingLoc(definition->getLocation());
+      if (!physicalPath(definitionLocation, sourceManager).empty()) {
+        out_ << locationJson(definitionLocation, sourceManager);
       } else {
         out_ << "null";
       }
@@ -86,33 +132,40 @@ public:
 
   void call(const clang::CallExpr *call, const clang::FunctionDecl *caller,
             clang::SourceManager &sourceManager) {
-    const auto location = sourceManager.getExpansionLoc(call->getExprLoc());
-    const auto presumed = sourceManager.getPresumedLoc(location);
-    if (!presumed.isValid() || presumed.isInvalid()) return;
+    const auto location = sourceManager.getSpellingLoc(call->getExprLoc());
+    const auto physical = physicalPath(location, sourceManager);
+    if (physical.empty() || !allowedPath(physical)) return;
     const clang::FunctionDecl *callee = call->getDirectCallee();
     std::string dispatch = "unknown-function-pointer";
     if (callee) {
       dispatch = "direct";
       if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(callee)) {
-        if (method->isVirtual()) dispatch = "virtual";
+        if (method->isVirtual()) {
+          const auto *member = llvm::dyn_cast<clang::MemberExpr>(call->getCallee()->IgnoreParenImpCasts());
+          if (!member || !member->hasQualifier()) dispatch = "virtual";
+        }
       }
     }
-    out_ << "{\"type\":\"call\",\"caller_usr\":";
-    if (const auto source = usrFor(caller)) out_ << quoted(*source); else out_ << "null";
+    out_ << "{\"schema\":1,\"type\":\"call\",\"caller_usr\":" << quoted(identityFor(caller, sourceManager));
     out_ << ",\"target_usr\":";
-    if (const auto target = usrFor(callee)) out_ << quoted(*target); else out_ << "null";
+    if (callee) out_ << quoted(identityFor(callee, sourceManager)); else out_ << "null";
     out_ << ",\"dispatch\":" << quoted(dispatch)
-         << ",\"location\":" << locationJson(presumed) << "}\n";
+         << ",\"location\":" << locationJson(location, sourceManager) << "}\n";
   }
 
 private:
-  std::string locationJson(const clang::PresumedLoc &location) const {
-    return "{\"file\":" + quoted(location.getFilename()) + ",\"line\":" +
-           std::to_string(location.getLine()) + ",\"column\":" +
-           std::to_string(location.getColumn()) + "}";
+  std::string locationJson(clang::SourceLocation location,
+                           clang::SourceManager &sourceManager) const {
+    const auto spelling = sourceManager.getSpellingLoc(location);
+    bool invalid = false;
+    const auto line = sourceManager.getSpellingLineNumber(spelling, &invalid);
+    const auto column = sourceManager.getSpellingColumnNumber(spelling, &invalid);
+    const auto offset = sourceManager.getFileOffset(spelling);
+    return "{\"file\":" + quoted(physicalPath(spelling, sourceManager)) + ",\"line\":" +
+           std::to_string(invalid ? 0 : line) + ",\"column\":" +
+           std::to_string(invalid ? 0 : column) + ",\"offset\":" + std::to_string(offset) + "}";
   }
   std::ostream &out_;
-  std::set<std::string> seen_;
 };
 
 class Visitor : public clang::RecursiveASTVisitor<Visitor> {
@@ -124,13 +177,29 @@ public:
     functionStack_.pop_back();
     return result;
   }
+  bool TraverseUnaryExprOrTypeTraitExpr(clang::UnaryExprOrTypeTraitExpr *expr) {
+    if (expr->isArgumentType()) return true;
+    unevaluatedDepth_++;
+    const bool result = clang::RecursiveASTVisitor<Visitor>::TraverseUnaryExprOrTypeTraitExpr(expr);
+    unevaluatedDepth_--;
+    return result;
+  }
+  bool TraverseCXXNoexceptExpr(clang::CXXNoexceptExpr *expr) {
+    unevaluatedDepth_++;
+    const bool result = clang::RecursiveASTVisitor<Visitor>::TraverseCXXNoexceptExpr(expr);
+    unevaluatedDepth_--;
+    return result;
+  }
   bool VisitFunctionDecl(clang::FunctionDecl *decl) {
-    if (!context_.getSourceManager().isInMainFile(decl->getLocation())) return true;
+    const auto path = physicalPath(decl->getLocation(), context_.getSourceManager());
+    if (!allowedPath(path)) return true;
     emitter_.entity(decl, context_.getSourceManager());
     return true;
   }
   bool VisitCallExpr(clang::CallExpr *call) {
-    if (!context_.getSourceManager().isInMainFile(call->getExprLoc())) return true;
+    if (unevaluatedDepth_ != 0) return true;
+    const auto path = physicalPath(call->getExprLoc(), context_.getSourceManager());
+    if (!allowedPath(path)) return true;
     if (!functionStack_.empty()) {
       emitter_.call(call, functionStack_.back(), context_.getSourceManager());
     }
@@ -140,6 +209,7 @@ private:
   clang::ASTContext &context_;
   Emitter &emitter_;
   std::vector<const clang::FunctionDecl *> functionStack_;
+  unsigned unevaluatedDepth_ = 0;
 };
 
 class Consumer : public clang::ASTConsumer {
@@ -158,6 +228,19 @@ public:
   explicit Action(Emitter &emitter) : emitter_(emitter) {}
   std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(clang::CompilerInstance &, llvm::StringRef) override {
     return std::make_unique<Consumer>(emitter_);
+  }
+  void EndSourceFileAction() override {
+    auto &sourceManager = getCompilerInstance().getSourceManager();
+    for (auto it = sourceManager.fileinfo_begin(); it != sourceManager.fileinfo_end(); ++it) {
+      const auto file = sourceManager.translateFile(it->first);
+      if (file.isInvalid()) continue;
+      bool invalid = false;
+      const auto content = sourceManager.getBufferData(file, &invalid);
+      if (invalid) continue;
+      const auto path = it->first.getName();
+      if (!allowedPath(path)) continue;
+      emitter_.file(path, content);
+    }
   }
 private:
   Emitter &emitter_;
@@ -181,6 +264,12 @@ int main(int argc, const char **argv) {
   if (!database) {
     llvm::errs() << "codeweave-analyzer: " << error << "\n";
     return 2;
+  }
+  for (const auto &command : database->getAllCompileCommands()) {
+    if (!safeCompileCommand(command)) {
+      llvm::errs() << "codeweave-analyzer: rejected unsafe compilation argument\n";
+      return 2;
+    }
   }
   std::ofstream output(OutputPath, std::ios::trunc);
   if (!output) {

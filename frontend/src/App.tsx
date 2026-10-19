@@ -8,8 +8,10 @@ const describe = (value: unknown) => typeof value === 'string' ? value : JSON.st
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 export default function App() {
   const [indexes, setIndexes] = useState<{ index_id: string; created_at: string }[]>([]);
-  const [indexPage, setIndexPage] = useState<number | null>(0);
+  const [indexPage, setIndexPage] = useState<number | null>(null);
   const [indexId, setIndexId] = useState('');
+  const [indexError, setIndexError] = useState(''); const [indexLoading, setIndexLoading] = useState(false);
+  const indexRequest = useRef(0); const indexAction = useRef<AbortController | undefined>(undefined);
   const [statusData, setStatus] = useState<Status>();
   const status = statusData?.index_id === indexId ? statusData : undefined;
   const [term, setTerm] = useState(''); const [offset, setOffset] = useState(0);
@@ -28,12 +30,19 @@ export default function App() {
   const flow = useRef<{ fitView: (options: { padding: number; maxZoom?: number }) => Promise<boolean> } | null>(null);
 
   const loadIndexes = useCallback(async (at: number) => {
-    try { const page = await api<Page<{ index_id: string; created_at: string }>>('indexes', { limit: 20, offset: at });
-      setIndexes(old => at ? [...old, ...page.items.filter(item => !old.some(p => p.index_id === item.index_id))] : page.items);
-      setIndexPage(page.next_offset); if (!at) setIndexId(page.index_id);
-    } catch (e) { setError(message(e)); }
+    indexAction.current?.abort(); const controller = new AbortController(); indexAction.current = controller;
+    const token = ++indexRequest.current; setIndexLoading(true); setIndexError('');
+    try { const page = await api<Page<{ index_id: string; created_at: string }>>('indexes', { limit: 20, offset: at }, controller.signal);
+      if (token !== indexRequest.current || controller.signal.aborted) return;
+      // Keep loaded history (including the selected page) while refreshing newest entries.
+      setIndexes(old => at ? [...old, ...page.items.filter(item => !old.some(p => p.index_id === item.index_id))]
+        : [...page.items, ...old.filter(item => !page.items.some(p => p.index_id === item.index_id))]);
+      setIndexPage(page.next_offset);
+      setIndexId(current => current || page.index_id);
+    } catch (e) { if (token === indexRequest.current && !controller.signal.aborted) setIndexError(message(e)); }
+    finally { if (token === indexRequest.current) setIndexLoading(false); }
   }, []);
-  useEffect(() => { void loadIndexes(0); return () => { action.current?.abort(); sourceAction.current?.abort(); }; }, [loadIndexes]);
+  useEffect(() => { void loadIndexes(0); return () => { indexRequest.current++; indexAction.current?.abort(); action.current?.abort(); sourceAction.current?.abort(); }; }, [loadIndexes]);
   useEffect(() => {
     epoch.current++; action.current?.abort(); sourceAction.current?.abort();
     setMap(undefined); setSelected(undefined); setSource(undefined); setEvidence(undefined); setStatus(undefined); setResults(undefined);
@@ -106,8 +115,10 @@ export default function App() {
     <div className="workspace"><aside className="sidebar">
       <section><div className="eyebrow">01 / INDEX</div><label htmlFor="index">Snapshot identity</label>
         <select id="index" value={indexId} onChange={e => setIndexId(e.target.value)}><option value="" disabled>Select an index</option>{indexes.map(i => <option key={i.index_id} value={i.index_id}>{i.created_at} · {i.index_id}</option>)}</select>
-        {indexPage !== null && <button className="text-button" onClick={() => void loadIndexes(indexPage)}>Load older indexes</button>}
+        {indexPage !== null && <button className="text-button" disabled={indexLoading} onClick={() => void loadIndexes(indexPage)}>Load older indexes</button>}
         <button className="text-button" onClick={() => void loadIndexes(0)}>Refresh indexes</button>
+        {indexLoading && <span role="status">Loading indexes…</span>}
+        {indexError && <div role="alert" className="error">{indexError}<button onClick={() => void loadIndexes(0)}>Retry indexes</button></div>}
         {status && <><code className="identity">{status.index_id}</code><div className="root-path">{describe(status.project_root)}</div><div className="stats"><span><b>{status.unit_count}</b> units</span><span><b>{status.input_count}</b> inputs</span><span>{describe(status.coverage)}</span></div><details><summary>Coverage & limitations</summary><p>{JSON.stringify(status.diagnostic_summary)}</p>{status.limitations.map(s => <p key={s}>{s}</p>)}</details></>}
       </section>
       <section className="search-section"><div className="eyebrow">02 / FIND SYMBOL</div><label htmlFor="search">Function or method</label><input id="search" placeholder="Search names and scopes…" value={term} onChange={e => { setTerm(e.target.value); setOffset(0); }} disabled={!indexId}/>

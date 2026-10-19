@@ -5,6 +5,11 @@ Node 22.12+, npm. `npm ci && npm run build`; serve `dist` through the local
 repository root. For development `npm run dev` proxies `/api` to 127.0.0.1:8000.
 No database, fake graph or external code service is embedded in the frontend.
 
+The first successful index-list load selects the newest saved index. Refreshing
+the list preserves your selection, graph and source, including history loaded
+from older pages. New indexes become options; only an explicit selection switches
+snapshots. A failed refresh keeps the current view and offers a retry.
+
 `npm test` checks interaction/state logic; `npm run build` includes strict type
 checking. `npx playwright install chromium` then `npm run test:e2e` runs actual
 browser integration. Set PYTHON, PYTHONPATH, CODEWEAVE_ANALYZER and optionally

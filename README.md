@@ -8,7 +8,7 @@ CodeWeave 的目标是从大型代码仓库自动生成可交互、可查询、�
 
 ## 当前状态
 
-这是仓库初始化后的 M0 版本，已实现 C++ LibTooling → SQLite → JSON CLI 的本地纵向闭环。当前覆盖函数/方法声明与定义、语义 USR 归并、直接调用点、虚调用标记、无法静态解析的函数指针调用以及索引快照读取。尚无交互图、工作区增量更新或版本分析；0.0.0 表示未发布；产品目标版本为 v0.1。
+这是仓库初始化后的 M0 版本，已实现 C++ LibTooling → SQLite → JSON CLI 的本地纵向闭环。当前覆盖函数/方法声明与定义、语义 USR 归并、直接调用点、虚调用标记、无法静态解析的函数指针调用以及索引快照读取。M1 增加真实索引驱动的 HTTP API、局部交互图和快照源码面板；尚无工作区增量更新或版本分析；0.0.0 表示未发布；产品目标版本为 v0.1。
 
 ## 产品边界
 
@@ -101,3 +101,37 @@ codeweave query status --database index.sqlite --field toolchain --field-offset 
 ## License
 
 MIT。第三方代码和素材保留各自许可证；被分析项目不因使用 CodeWeave 而改变许可。
+
+
+## M1：本地交互地图
+
+依赖 Node **22.12+**、npm、Python 3.11+。查询现有 M0 schema 3 索引无需启动 Clang；建库仍须真实分析器和 Bubblewrap。前后端不依赖工作流仓库。
+
+```bash
+python -m pip install -e './backend[dev]'
+cd frontend
+npm ci
+npm run build
+cd ..
+codeweave serve --database /path/to/index.sqlite3 --frontend frontend/dist
+# 浏览器打开 http://127.0.0.1:8000
+```
+
+服务固定监听本机，可用 `--port` 更改端口；数据库/前端目录只接受受信启动参数。页面选择索引、搜索函数/方法，搜索结果保留 USR 区分重载与同名实体。选中后加载一层调用点；点击邻居后展开/收起、居中/缩放/重置。点击节点或调用点显示 Monaco 中的**保存快照**、物理路径、行列、index_id 和来源。虚调用为静态声明目标，未知目标保留为未知；图不是运行轨迹。
+
+页面每层最多各 12 个 caller/callee 调用点，累计 100 节点、150 调用点、24 次邻接请求；到达预算应收起或重置。每个真实调用实例一条边，递归和环按身份去重。页面提示剩余调用点，可用分页 HTTP/CLI 继续查询。布局为确定性网格，复杂图的高级布局和大型工程性能不属于本阶段。源码编辑器按需加载，首次源码显示需下载较大的本地 Monaco 模块；不使用 CDN、远程源码或 LLM。
+
+开发时分别运行 `codeweave serve --database ...` 与 `cd frontend && npm run dev`；Vite 同源代理 `/api` 到本机 8000。默认无跨域开放，Host 限本机名称；不适合直接暴露到网络。服务不检测当前磁盘修改：历史 index_id 永远读历史快照，刷新索引列表可选择新发布索引，选择后清空旧图和源码。
+
+API 及预算见 [HTTP 契约](docs/http-api.md)。`query search/callers/callees/indexes` 支持稳定 `--offset` 分页，`query neighbors <USR>` 与 HTTP 使用同一局部图内核。超大事实响应明确拒绝，原始数据库不截断。
+
+完整 M1 验收（全新构建分析器、全部后端、前端类型/构建/测试、真实 Chromium）：
+
+```bash
+export CODEWEAVE_LLVM_PREFIX=/path/to/llvm
+# 可选 PYTHON=/path/to/venv/bin/python
+cd frontend && npx playwright install chromium && cd ..
+bash scripts/verify_m1.sh
+```
+
+验收需要真实命名空间权限；Bubblewrap 无法运行或分析器缺失时失败，不能以 Skip 替代。Playwright 自行创建两份自有多文件 fixture 索引、启动本机服务并验证页面；不分析外部项目。测试 trace/build/index 留在临时或忽略目录，不入库。

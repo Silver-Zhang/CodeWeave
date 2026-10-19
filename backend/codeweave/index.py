@@ -460,13 +460,15 @@ def _status(connection: sqlite3.Connection, active: str, limit: int, offset: int
     return response
 
 
-def query(database: Path, command: str, value: str | None = None, index_id: str | None = None, limit: int = 50, start_line: int | None = None, end_line: int | None = None, details: str | None = None, offset: int = 0, field: str | None = None, field_offset: int = 0) -> dict[str, object]:
+def _query(database: Path, command: str, value: str | None = None, index_id: str | None = None, limit: int = 50, start_line: int | None = None, end_line: int | None = None, details: str | None = None, offset: int = 0, field: str | None = None, field_offset: int = 0, clamp_end: bool = False) -> dict[str, object]:
     if not 1 <= limit <= 200:
         raise IndexError("invalid_limit", "limit must be from 1 to 200")
     if not 0 <= offset <= 2**63 - 1 or field_offset < 0:
         raise IndexError("invalid_offset", "row offset must fit a nonnegative SQLite integer; field offset must be nonnegative")
-    if command != "status" and (details is not None or offset or field is not None or field_offset):
+    if command != "status" and (details is not None or field is not None or field_offset):
         raise IndexError("invalid_arguments", "details, offsets and field apply only to status")
+    if offset and command not in {"status", "search", "callers", "callees", "indexes"}:
+        raise IndexError("invalid_offset", "this query does not support pagination")
     if field_offset and not field:
         raise IndexError("invalid_arguments", "field offset requires a field")
     if command in {"show", "callers", "callees", "source"} and not value:
@@ -481,13 +483,19 @@ def query(database: Path, command: str, value: str | None = None, index_id: str 
             return _status(connection, active, limit, offset, details, field, field_offset)
         if command in {"show", "callers", "callees", "source"} and not value:
             raise IndexError("missing_argument", f"{command} requires a value")
-        if command == "search":
-            rows = connection.execute("SELECT * FROM symbols WHERE index_id = ? AND name LIKE ? ORDER BY name, usr LIMIT ?", (active, f"%{value or ''}%", limit + 1)).fetchall()
+        total = None
+        if command == "indexes":
+            rows = connection.execute("SELECT id AS index_id,created_at,coverage,schema_version FROM indexes ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit + 1, offset)).fetchall()
+            total = connection.execute("SELECT count(*) FROM indexes").fetchone()[0]
+        elif command == "search":
+            rows = connection.execute("SELECT * FROM symbols WHERE index_id = ? AND name LIKE ? ORDER BY name, usr LIMIT ? OFFSET ?", (active, f"%{value or ''}%", limit + 1, offset)).fetchall()
+            total = connection.execute("SELECT count(*) FROM symbols WHERE index_id=? AND name LIKE ?", (active, f"%{value or ''}%")).fetchone()[0]
         elif command == "show":
             rows = connection.execute("SELECT * FROM symbols WHERE index_id = ? AND usr = ?", (active, value)).fetchall()
         elif command in {"callers", "callees"}:
             other, filter_field = ("caller_usr", "target_usr") if command == "callers" else ("target_usr", "caller_usr")
-            rows = connection.execute(f"SELECT calls.*, symbols.name AS other_name FROM calls LEFT JOIN symbols ON symbols.index_id = calls.index_id AND symbols.usr = calls.{other} WHERE calls.index_id = ? AND calls.{filter_field} = ? ORDER BY calls.file, calls.line, calls.column_number LIMIT ?", (active, value, limit + 1)).fetchall()
+            rows = connection.execute(f"SELECT calls.*, symbols.name AS other_name FROM calls LEFT JOIN symbols ON symbols.index_id = calls.index_id AND symbols.usr = calls.{other} WHERE calls.index_id = ? AND calls.{filter_field} = ? ORDER BY calls.file, calls.line, calls.column_number,calls.instance_id LIMIT ? OFFSET ?", (active, value, limit + 1, offset)).fetchall()
+            total = connection.execute(f"SELECT count(*) FROM calls WHERE index_id=? AND {filter_field}=?", (active, value)).fetchone()[0]
         elif command == "source":
             if start_line is None or end_line is None or start_line < 1 or end_line < start_line:
                 raise IndexError("invalid_range", "source requires a valid inclusive line range")
@@ -497,6 +505,10 @@ def query(database: Path, command: str, value: str | None = None, index_id: str 
             if not row or row["content"] is None:
                 raise IndexError("source_not_registered", "path is not registered in this index")
             lines = bytes(row["content"]).splitlines(keepends=True)
+            if clamp_end:
+                end_line = min(end_line, len(lines))
+            if start_line > len(lines):
+                raise IndexError("invalid_range", "source range exceeds the indexed snapshot")
             if end_line > len(lines):
                 raise IndexError("invalid_range", "source range exceeds the indexed snapshot")
             content = b"".join(lines[start_line - 1:end_line])
@@ -514,8 +526,53 @@ def query(database: Path, command: str, value: str | None = None, index_id: str 
             for item in items:
                 item["anchors"] = json.loads(item["anchors"])
                 item["units"] = [r[0] for r in connection.execute("SELECT source_file FROM call_units WHERE index_id=? AND instance_id=? ORDER BY source_file", (active, item["instance_id"]))]
-        return {"index_id": active, "items": items, "truncated": len(rows) > limit}
+        result = {"index_id": active, "items": items, "truncated": len(rows) > limit}
+        if total is not None:
+            remaining = max(0, total - offset - len(items))
+            result.update(offset=offset, limit=limit, returned_count=len(items), total_count=total,
+                          remaining_count=remaining, has_more=bool(remaining), next_offset=offset + len(items) if remaining else None)
+        return result
     except sqlite3.Error as error:
         raise IndexError("database_error", "database query failed") from error
     finally:
         connection.close()
+
+
+MAX_QUERY_BYTES = 262_144
+
+
+def query(database: Path, command: str, value: str | None = None, index_id: str | None = None,
+          limit: int = 50, start_line: int | None = None, end_line: int | None = None,
+          details: str | None = None, offset: int = 0, field: str | None = None,
+          field_offset: int = 0, clamp_end: bool = False) -> dict:
+    """One read-only kernel for CLI and HTTP; oversize facts fail explicitly."""
+    if command == "neighbors":
+        if not 1 <= limit <= 50 or offset or details or field or field_offset:
+            raise IndexError("invalid_arguments", "neighbors requires limit 1..50 and no pagination options")
+        found = query(database, "show", value, index_id)
+        if not found["items"]:
+            raise IndexError("symbol_not_found", "symbol is not present in this index")
+        active = found["index_id"]
+        nodes = {value: found["items"][0]}
+        edges = {}
+        pages = {}
+        for direction in ("callers", "callees"):
+            page = query(database, direction, value, active, limit)
+            pages[direction] = {k: v for k, v in page.items() if k not in {"items", "index_id"}}
+            for call in page["items"]:
+                source = call["caller_usr"]
+                target = call["target_usr"] or "unknown:" + call["instance_id"]
+                for usr in (source, target):
+                    if usr not in nodes:
+                        entity = query(database, "show", usr, active)["items"] if not usr.startswith("unknown:") else []
+                        nodes[usr] = entity[0] if entity else {"usr": usr, "name": "Unresolved indirect target" if usr.startswith("unknown:") else usr,
+                                                            "kind": "unknown" if usr.startswith("unknown:") else "external", "index_id": active}
+                edges[call["instance_id"]] = {**call, "source": source, "target": target}
+        result = {"index_id": active, "center": value, "nodes": list(nodes.values()), "edges": list(edges.values()),
+                  "pages": pages, "limits": {"nodes": 101, "edges": 100, "per_direction": limit},
+                  "semantics": "Static call sites; virtual targets are static declarations, unknown targets are unresolved."}
+    else:
+        result = _query(database, command, value, index_id, limit, start_line, end_line, details, offset, field, field_offset, clamp_end)
+    if _status_size(result) > MAX_QUERY_BYTES:
+        raise IndexError("query_limit", "query exceeds 262144 JSON bytes; reduce the page size or use status field chunks for provenance")
+    return result

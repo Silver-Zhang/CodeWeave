@@ -1,5 +1,6 @@
 """Versioned index. Untrusted compilation input runs only inside Bubblewrap."""
 from __future__ import annotations
+import base64
 import hashlib
 import json
 import os
@@ -14,6 +15,9 @@ import uuid
 
 SCHEMA_VERSION = 3
 FACT_SCHEMA_VERSION = 2
+MAX_STATUS_BYTES = 32_768  # Serialized UTF-8 JSON, using the CLI serializer.
+MAX_STATUS_FIELD_BYTES = 2_048
+STATUS_CHUNK_BYTES = 4_096
 MAX_SOURCE_LINES = 200
 MAX_SOURCE_BYTES = 32_768  # Raw snapshot bytes, before JSON escaping.
 COVERAGE_LIMITS = ["explicit evaluated CallExpr only", "no implicit lifecycle or global initializer edges",
@@ -122,6 +126,10 @@ def _trusted_root(path: Path) -> Path:
     return root
 
 def _safe_arguments(arguments: list[str], source: Path, directory: Path, roots: list[Path]) -> list[str]:
+    # LLVM expands leading-@ tokens before interpreting option/value groups.
+    # Check the entire original argv, including values and discarded -o operands.
+    if any(arg.startswith("@") for arg in arguments):
+        raise IndexError("unsafe_compilation_argument", "response files are not supported in any argument position")
     if not arguments or Path(arguments[0]).name not in {"c++", "g++", "clang++", "clang"}:
         raise IndexError("unsafe_compilation_argument", "compiler executable is not supported")
     # The compiler spelling selects a driver language, never an executable/mount.
@@ -371,9 +379,96 @@ def _index(connection: sqlite3.Connection, index_id: str | None) -> str:
     return str(row["id"])
 
 
-def query(database: Path, command: str, value: str | None = None, index_id: str | None = None, limit: int = 50, start_line: int | None = None, end_line: int | None = None) -> dict[str, object]:
+def _status_size(value: object) -> int:
+    # Match cli._json, including its trailing newline, rather than counting raw text.
+    return len(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")) + 1
+
+
+def _status_value(value: str, parse_json: bool = False) -> object:
+    raw = value.encode("utf-8")
+    if len(raw) <= MAX_STATUS_FIELD_BYTES:
+        return json.loads(value) if parse_json else value
+    return {"truncated": True, "preview": raw[:MAX_STATUS_FIELD_BYTES].decode("utf-8", errors="ignore"),
+            "utf8_bytes": len(raw), "sha256": _sha256(raw)}
+
+
+def _status(connection: sqlite3.Connection, active: str, limit: int, offset: int,
+            details: str | None, field: str | None, field_offset: int) -> dict:
+    if details not in {None, "units", "inputs"}:
+        raise IndexError("invalid_arguments", "status details must be units or inputs")
+    if field:
+        allowed = {None: {"toolchain"}, "units": {"command", "diagnostics", "source_file"}, "inputs": {"path"}}
+        if field not in allowed[details] or (details and limit != 1):
+            raise IndexError("invalid_arguments", "field must match status details; select one detail with --limit 1")
+        if details:
+            table, order = ("units", "source_file") if details == "units" else ("files", "path")
+            row = connection.execute(f"SELECT {field} FROM {table} WHERE index_id=? ORDER BY {order} LIMIT 1 OFFSET ?", (active, offset)).fetchone()
+        else:
+            if offset:
+                raise IndexError("invalid_arguments", "toolchain field does not have a row offset")
+            row = connection.execute("SELECT toolchain FROM indexes WHERE id=?", (active,)).fetchone()
+        if row is None:
+            raise IndexError("status_item_not_found", "no status item at the requested offset")
+        raw = row[0].encode("utf-8")
+        if field_offset > len(raw):
+            raise IndexError("invalid_offset", "field offset exceeds the stored UTF-8 bytes")
+        chunk = raw[field_offset:field_offset + STATUS_CHUNK_BYTES]
+        end = field_offset + len(chunk)
+        response = {"index_id": active, "details": details, "offset": offset, "field": field,
+                    "field_offset": field_offset, "field_bytes": len(raw), "field_sha256": _sha256(raw),
+                    "encoding": "base64", "content": base64.b64encode(chunk).decode("ascii"),
+                    "returned_bytes": len(chunk), "next_field_offset": end if end < len(raw) else None,
+                    "has_more": end < len(raw)}
+    elif details:
+        table, order = ("units", "source_file") if details == "units" else ("files", "path")
+        columns = "source_file,command_sha256,status,diagnostics,command" if details == "units" else "path,sha256,scope"
+        total = connection.execute(f"SELECT count(*) FROM {table} WHERE index_id=?", (active,)).fetchone()[0]
+        rows = connection.execute(f"SELECT {columns} FROM {table} WHERE index_id=? ORDER BY {order} LIMIT ? OFFSET ?", (active, limit, offset))
+        response = {"index_id": active, "details": details, "offset": offset, "limit": limit,
+                    "total_count": total, "items": [], "returned_count": 0, "remaining_count": max(0, total - offset),
+                    "next_offset": None, "has_more": False, "budget_limited": False}
+        for row in rows:
+            item = {key: _status_value(row[key], key in {"command", "diagnostics"}) for key in row.keys()}
+            response["items"].append(item)
+            count = len(response["items"])
+            remaining = max(0, total - offset - count)
+            response.update(returned_count=count, remaining_count=remaining, next_offset=offset + count if remaining else None, has_more=bool(remaining))
+            if _status_size(response) > MAX_STATUS_BYTES - 128:
+                response["items"].pop()
+                response["budget_limited"] = True
+                break
+        count = len(response["items"])
+        remaining = max(0, total - offset - count)
+        response.update(returned_count=count, remaining_count=remaining, next_offset=offset + count if remaining else None, has_more=bool(remaining))
+        if not count and remaining:
+            raise IndexError("status_limit", "one status item exceeds the response budget; use field chunks")
+    else:
+        if offset or field_offset:
+            raise IndexError("invalid_arguments", "offset requires status details or a field")
+        row = connection.execute("SELECT * FROM indexes WHERE id=?", (active,)).fetchone()
+        diagnostic_summary = {"error": 0, "warning": 0, "note": 0}
+        for level, count in connection.execute("SELECT json_extract(d.value,'$.level'),count(*) FROM units u,json_each(u.diagnostics) d WHERE u.index_id=? GROUP BY json_extract(d.value,'$.level')", (active,)):
+            diagnostic_summary[level] = count
+        response = {"index_id": active, "schema_version": row["schema_version"], "coverage": _status_value(row["coverage"]),
+                    "project_root": _status_value(row["project_root"]), "compilation_database": _status_value(row["compilation_database"]),
+                    "compilation_sha256": _status_value(row["compilation_sha256"]),
+                    "unit_count": connection.execute("SELECT count(*) FROM units WHERE index_id=?", (active,)).fetchone()[0],
+                    "input_count": connection.execute("SELECT count(*) FROM files WHERE index_id=?", (active,)).fetchone()[0],
+                    "diagnostic_summary": diagnostic_summary, "limitations": COVERAGE_LIMITS}
+    if _status_size(response) > MAX_STATUS_BYTES:
+        raise IndexError("status_limit", "status response exceeds the serialized JSON budget")
+    return response
+
+
+def query(database: Path, command: str, value: str | None = None, index_id: str | None = None, limit: int = 50, start_line: int | None = None, end_line: int | None = None, details: str | None = None, offset: int = 0, field: str | None = None, field_offset: int = 0) -> dict[str, object]:
     if not 1 <= limit <= 200:
         raise IndexError("invalid_limit", "limit must be from 1 to 200")
+    if not 0 <= offset <= 2**63 - 1 or field_offset < 0:
+        raise IndexError("invalid_offset", "row offset must fit a nonnegative SQLite integer; field offset must be nonnegative")
+    if command != "status" and (details is not None or offset or field is not None or field_offset):
+        raise IndexError("invalid_arguments", "details, offsets and field apply only to status")
+    if field_offset and not field:
+        raise IndexError("invalid_arguments", "field offset requires a field")
     if command in {"show", "callers", "callees", "source"} and not value:
         raise IndexError("missing_argument", f"{command} requires a value")
     if not database.is_file():
@@ -383,11 +478,7 @@ def query(database: Path, command: str, value: str | None = None, index_id: str 
         _validate_schema(connection)
         active = _index(connection, index_id)
         if command == "status":
-            row = connection.execute("SELECT * FROM indexes WHERE id = ?", (active,)).fetchone()
-            return {"index_id": active, "coverage": row["coverage"], "compilation_database": row["compilation_database"], "compilation_sha256": row["compilation_sha256"], "schema_version": row["schema_version"], "project_root": row["project_root"],
-                    "toolchain": json.loads(row["toolchain"]), "limitations": COVERAGE_LIMITS,
-                    "units": [{**dict(unit), "diagnostics": json.loads(unit["diagnostics"]), "command": json.loads(unit["command"])} for unit in connection.execute("SELECT * FROM units WHERE index_id = ? ORDER BY source_file", (active,))],
-                    "inputs": [dict(item) for item in connection.execute("SELECT path, sha256, scope FROM files WHERE index_id = ? ORDER BY path", (active,))]}
+            return _status(connection, active, limit, offset, details, field, field_offset)
         if command in {"show", "callers", "callees", "source"} and not value:
             raise IndexError("missing_argument", f"{command} requires a value")
         if command == "search":

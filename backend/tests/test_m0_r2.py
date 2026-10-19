@@ -203,8 +203,8 @@ def test_C_diagnostics_and_failed_publication(project, tmp_path, argument):
         commands(project, ["a.cpp"], argument.split())
     if argument == "warning":
         index(project, db)
-        status = q(db, "status")
-        assert any(d["level"] == "warning" and "tracked_warning" in d["message"] for u in status["units"] for d in u["diagnostics"])
+        status = q(db, "status", "--details", "units")
+        assert any(d["level"] == "warning" and "tracked_warning" in d["message"] for u in status["items"] for d in u["diagnostics"])
     else:
         assert index(project, db, code=2)["error"]["code"] == "analysis_failed"
         assert q(db, "status")["index_id"] == old["index_id"]
@@ -261,7 +261,7 @@ def test_C_roots_line_and_dependencies(project, tmp_path):
     write(project, "src/a.cpp", '#include "dep.hpp"\nint a() { return VALUE; }\n')
     commands(project, ["src/a.cpp"], ["-I" + str(dep)])
     cli("index", "--project-root", project, "--dependency-root", dep, "--compilation-database", project, "--database", db, "--analyzer", ANALYZER)
-    assert any(f["path"] == str(dep / "dep.hpp") and f["scope"] == "dependency" for f in q(db, "status")["inputs"])
+    assert any(f["path"] == str(dep / "dep.hpp") and f["scope"] == "dependency" for f in q(db, "status", "--details", "inputs")["items"])
     assert q(db, "source", dep / "dep.hpp", "--start-line", 1, "--end-line", 1, code=2)["error"]["code"] == "source_not_registered"
 
 
@@ -363,10 +363,11 @@ inline int shared() {
     assert code == 0, result
     status = q(db, "status")
     assert status["compilation_sha256"] == hashlib.sha256(original["compile_commands.json"]).hexdigest()
+    inputs = q(db, "status", "--details", "inputs")["items"]
     for file in ["a.cpp", "b.cpp", "shared.hpp", "config.hpp"]:
         snapshot = q(db, "source", project / file, "--start-line", 1, "--end-line", len(original[file].splitlines()))["content"]
         assert snapshot.encode() == original[file]
-        assert next(i["sha256"] for i in status["inputs"] if i["path"] == str(project / file)) == hashlib.sha256(original[file]).hexdigest()
+        assert next(i["sha256"] for i in inputs if i["path"] == str(project / file)) == hashlib.sha256(original[file]).hexdigest()
     shared = q(db, "search", "shared")["items"][0]
     assert [c["other_name"] for c in q(db, "callees", shared["usr"])["items"]] == ["old_target"]
 
@@ -472,8 +473,8 @@ def test_C_standard_headers(project, tmp_path):
     db = tmp_path / "index.db"
     index(project, db)
     status = q(db, "status")
-    assert any(i["scope"] == "dependency" for i in status["inputs"])
-    assert all(u["command"]["clang_version"] for u in status["units"])
+    assert any(i["scope"] == "dependency" for i in q(db, "status", "--details", "inputs")["items"])
+    assert all(u["command"]["clang_version"] for u in q(db, "status", "--details", "units")["items"])
 
 
 def test_A_command_directory_in_identity(project):

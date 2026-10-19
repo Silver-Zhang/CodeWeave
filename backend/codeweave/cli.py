@@ -42,6 +42,10 @@ def main() -> None:
     query_parser.add_argument("--database", type=Path, required=True)
     query_parser.add_argument("--index-id")
     query_parser.add_argument("--limit", type=int, default=50)
+    query_parser.add_argument("--details", choices=["units", "inputs"], help="Paged status details")
+    query_parser.add_argument("--offset", type=int, default=0, help="Status detail row offset")
+    query_parser.add_argument("--field", choices=["command", "diagnostics", "source_file", "path", "toolchain"], help="Read one status field in bounded byte chunks")
+    query_parser.add_argument("--field-offset", type=int, default=0, help="UTF-8 byte offset within a status field")
     query_parser.add_argument("--start-line", type=int)
     query_parser.add_argument("--end-line", type=int)
     try:
@@ -54,7 +58,7 @@ def main() -> None:
         elif args.command == "index":
             _json(build_index(args.database, args.compilation_database, args.analyzer, args.project_root, args.dependency_root, args.toolchain_root, args.resource_dir))
         elif args.command == "query":
-            _json(query(args.database, args.query_command, args.value, args.index_id, args.limit, args.start_line, args.end_line))
+            _json(query(args.database, args.query_command, args.value, args.index_id, args.limit, args.start_line, args.end_line, args.details, args.offset, args.field, args.field_offset))
     except IndexError as error:
         _fail(error.code, str(error))
     except (OSError, ValueError, sqlite3.Error, argparse.ArgumentError) as error:

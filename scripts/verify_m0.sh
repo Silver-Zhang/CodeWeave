@@ -26,7 +26,8 @@ sha256sum "$CODEWEAVE_ANALYZER" "$root/analyzer/main.cpp"
 PYTHONPATH="$root/backend" "$python" -m pytest \
   "$root/backend/tests/test_m0_index.py" \
   "$root/backend/tests/test_m0_correction.py" \
-  "$root/backend/tests/test_m0_r2.py" --junitxml="$build/results.xml" -q
+  "$root/backend/tests/test_m0_r2.py" \
+  "$root/backend/tests/test_m0_final_hardening.py" --junitxml="$build/results.xml" -q
 "$python" - "$build/results.xml" <<'PY'
 import sys
 import xml.etree.ElementTree as ET

@@ -27,7 +27,10 @@ def main() -> None:
     parser = JsonArgumentParser(prog="codeweave", description="Local CodeWeave code map", exit_on_error=False)
     subparsers = parser.add_subparsers(dest="command", required=True, parser_class=JsonArgumentParser)
     subparsers.add_parser("version", help="Show package version")
-    subparsers.add_parser("serve", help="Start local API at 127.0.0.1:8000")
+    serve = subparsers.add_parser("serve", help="Start the read-only local API")
+    serve.add_argument("--database", type=Path, required=True)
+    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--frontend", type=Path, help="Trusted Vite dist directory to serve at /")
     index_parser = subparsers.add_parser("index", help="Build a persistent SQLite index", exit_on_error=False)
     index_parser.add_argument("--compilation-database", type=Path, required=True, help="Directory containing compile_commands.json")
     index_parser.add_argument("--database", type=Path, required=True, help="SQLite database path")
@@ -37,13 +40,13 @@ def main() -> None:
     index_parser.add_argument("--toolchain-root", type=Path, action="append", default=[])
     index_parser.add_argument("--resource-dir", type=Path, help="Trusted Clang resource directory containing include/")
     query_parser = subparsers.add_parser("query", help="Query a persistent index", exit_on_error=False)
-    query_parser.add_argument("query_command", choices=["status", "search", "show", "callers", "callees", "source"])
+    query_parser.add_argument("query_command", choices=["status", "indexes", "search", "show", "callers", "callees", "neighbors", "source"])
     query_parser.add_argument("value", nargs="?")
     query_parser.add_argument("--database", type=Path, required=True)
     query_parser.add_argument("--index-id")
     query_parser.add_argument("--limit", type=int, default=50)
     query_parser.add_argument("--details", choices=["units", "inputs"], help="Paged status details")
-    query_parser.add_argument("--offset", type=int, default=0, help="Status detail row offset")
+    query_parser.add_argument("--offset", type=int, default=0, help="Page row offset")
     query_parser.add_argument("--field", choices=["command", "diagnostics", "source_file", "path", "toolchain"], help="Read one status field in bounded byte chunks")
     query_parser.add_argument("--field-offset", type=int, default=0, help="UTF-8 byte offset within a status field")
     query_parser.add_argument("--start-line", type=int)
@@ -54,7 +57,10 @@ def main() -> None:
             _json({"version": __version__})
         elif args.command == "serve":
             import uvicorn
-            uvicorn.run("codeweave.app:app", host="127.0.0.1", port=8000, reload=False)
+            from codeweave.app import create_app
+            if not 1 <= args.port <= 65535:
+                raise ValueError("port must be 1..65535")
+            uvicorn.run(create_app(args.database, args.frontend), host="127.0.0.1", port=args.port, reload=False)
         elif args.command == "index":
             _json(build_index(args.database, args.compilation_database, args.analyzer, args.project_root, args.dependency_root, args.toolchain_root, args.resource_dir))
         elif args.command == "query":

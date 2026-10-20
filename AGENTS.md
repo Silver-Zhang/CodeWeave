@@ -20,4 +20,4 @@ Do not require access to any workflow repository to use, build, or contribute to
 - Report bootstrap, indexing, UI and validation capabilities separately.
   A health-check success is not proof of a working analyzer.
 
-The current checkout contains only a bootstrap.
+M0 provides the analyzer/index/CLI; M1 adds a read-only local API and interactive map.

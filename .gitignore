@@ -26,3 +26,6 @@ compile_commands.json
 /artifacts/
 /inputs/
 /third_party_private/
+
+/frontend/test-results/
+/frontend/playwright-report/

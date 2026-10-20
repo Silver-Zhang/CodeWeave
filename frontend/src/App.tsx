@@ -1,13 +1,19 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Background, Controls, MarkerType, ReactFlow } from '@xyflow/react';
-import { api, type Entity, type Graph, type Page, type Source, type Status } from './api';
+import { api, type Entity, type Graph, type Page, type Source, type Status, type IndexEntry, type ChangeEvent } from './api';
+import WorkspacePanel from './WorkspacePanel';
 import SourceBoundary from './SourceBoundary';
 import { BUDGET, flatten, mergeGraph, position, type MapState } from './graph';
 const SourcePanel = lazy(() => import('./SourcePanel'));
 const describe = (value: unknown) => typeof value === 'string' ? value : JSON.stringify(value);
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 export default function App() {
-  const [indexes, setIndexes] = useState<{ index_id: string; created_at: string }[]>([]);
+  const [indexes, setIndexes] = useState<IndexEntry[]>([]);
+  const [hasWorkspace, setHasWorkspace] = useState(false);
+  const [highlight, setHighlight] = useState<ChangeEvent | null>(null);
+  const [focus, setFocus] = useState<{index:string;usr:string}>();
+  const focusAction = useRef<AbortController | undefined>(undefined);
+  const initialMap = useRef(false);
   const [indexPage, setIndexPage] = useState<number | null>(null);
   const [indexId, setIndexId] = useState('');
   const [indexError, setIndexError] = useState(''); const [indexLoading, setIndexLoading] = useState(false);
@@ -32,7 +38,7 @@ export default function App() {
   const loadIndexes = useCallback(async (at: number) => {
     indexAction.current?.abort(); const controller = new AbortController(); indexAction.current = controller;
     const token = ++indexRequest.current; setIndexLoading(true); setIndexError('');
-    try { const page = await api<Page<{ index_id: string; created_at: string }>>('indexes', { limit: 20, offset: at }, controller.signal);
+    try { const page = await api<Page<IndexEntry>>('indexes', { limit: 20, offset: at }, controller.signal);
       if (token !== indexRequest.current || controller.signal.aborted) return;
       // Keep loaded history (including the selected page) while refreshing newest entries.
       setIndexes(old => at ? [...old, ...page.items.filter(item => !old.some(p => p.index_id === item.index_id))]
@@ -42,6 +48,21 @@ export default function App() {
     } catch (e) { if (token === indexRequest.current && !controller.signal.aborted) setIndexError(message(e)); }
     finally { if (token === indexRequest.current) setIndexLoading(false); }
   }, []);
+  const onPublished = useCallback(() => {void loadIndexes(0);}, [loadIndexes]);
+  const onInspect = useCallback((index:string,usr:string) => {setIndexId(index);setFocus({index,usr});}, []);
+  useEffect(() => {
+    if (!focus || focus.index!==indexId) return;
+    focusAction.current?.abort(); const controller=new AbortController();focusAction.current=controller;
+    api<Page<Entity>>('symbol',{index_id:focus.index,usr:focus.usr},controller.signal).then(page => {
+      if (!controller.signal.aborted && page.items[0]) {setFocus(undefined);void expand(page.items[0],true);}
+    }).catch(e => {if (!controller.signal.aborted)setError(message(e));});
+    return () => controller.abort();
+  }, [focus,indexId]);
+  useEffect(() => {
+    if (hasWorkspace && !initialMap.current && results?.items[0] && !focus) {
+      initialMap.current=true;void expand(results.items[0],true);
+    }
+  }, [hasWorkspace,results,focus]);
   useEffect(() => { void loadIndexes(0); return () => { indexRequest.current++; indexAction.current?.abort(); action.current?.abort(); sourceAction.current?.abort(); }; }, [loadIndexes]);
   useEffect(() => {
     epoch.current++; action.current?.abort(); sourceAction.current?.abort();
@@ -71,6 +92,7 @@ export default function App() {
     } catch (e) { if (!controller.signal.aborted) { setNotice(''); setError(message(e)); } }
   }
   function select(entity: Entity) {
+    focusAction.current?.abort();setFocus(undefined);
     setSelected(entity);
     void locate(entity.definition_file ?? entity.declaration_file, entity.definition_line ?? entity.declaration_line,
       entity.definition_column ?? entity.declaration_column ?? 1, entity);
@@ -93,15 +115,16 @@ export default function App() {
     finally { if (epoch.current === token) setBusy(false); }
   }
   const visible = useMemo(() => map ? flatten(map) : { nodes: [], edges: [] }, [map]);
+  const changedUsrs = useMemo(() => new Set([highlight?.before?.usr,highlight?.after?.usr,highlight?.before?.caller_usr,highlight?.after?.caller_usr,highlight?.before?.target_usr,highlight?.after?.target_usr].filter(Boolean)), [highlight]);
   const nodes = useMemo(() => visible.nodes.map((entity, i) => ({ id: entity.usr, position: position(i),
     data: { label: <div className="node-label"><span>{entity.kind === 'unknown' ? '? Unresolved target' : entity.name}</span><small>{entity.kind} {map?.batches[entity.usr] ? '· expanded' : ''}<br/>{(entity.definition_file ?? entity.declaration_file)?.split('/').slice(-2).join('/')}:{entity.definition_line ?? entity.declaration_line}</small></div> },
-    selected: selected?.usr === entity.usr, style: { width: 270, borderColor: entity.kind === 'unknown' ? '#d4a95d' : selected?.usr === entity.usr ? '#5cdbc6' : '#3a4a59' }
-  })), [visible.nodes, selected, map]);
+    selected: selected?.usr === entity.usr, style: { width: 270, borderColor: changedUsrs.has(entity.usr) ? '#f4b45d' : entity.kind === 'unknown' ? '#d4a95d' : selected?.usr === entity.usr ? '#5cdbc6' : '#3a4a59', borderWidth:changedUsrs.has(entity.usr)?3:1 }
+  })), [visible.nodes, selected, map,changedUsrs]);
   const edges = useMemo(() => visible.edges.map(call => ({ id: call.instance_id, source: call.source, target: call.target,
     label: call.dispatch === 'virtual' ? 'virtual · static target' : call.dispatch, markerEnd: { type: MarkerType.ArrowClosed },
-    style: { stroke: call.dispatch === 'direct' ? '#6ba6b4' : '#d4a95d', strokeWidth: 2, strokeDasharray: call.dispatch === 'direct' ? undefined : '6 4' },
+    style: { stroke: [highlight?.before,highlight?.after].some(ref => ref?.caller_usr===call.caller_usr && ref?.target_usr===call.target_usr) ? '#f4b45d' : call.dispatch === 'direct' ? '#6ba6b4' : '#d4a95d', strokeWidth: 2, strokeDasharray: call.dispatch === 'direct' ? undefined : '6 4' },
     labelStyle: { fill: '#e1e8ec', fontSize: 11 }, labelBgStyle: { fill: '#18232e' },
-  })), [visible.edges]);
+  })), [visible.edges,highlight]);
   useEffect(() => { if (nodes.length) requestAnimationFrame(() => { void flow.current?.fitView({ padding: 0.18, maxZoom: 1 }); }); }, [nodes.length]);
   function collapse() {
     if (!map || !selected) return;
@@ -111,10 +134,10 @@ export default function App() {
     setMap({ ...map, batches }); setNotice('Collapsed expansion; shared neighbors remain visible.');
   }
   return <div className="app">
-    <header><div className="brand"><b>⌘</b><div>CodeWeave<small>STRUCTURE EXPLORER</small></div></div><div className="header-note">LOCAL INDEX / M1<span className="live-dot" /> Read only</div></header>
+    <header><div className="brand"><b>⌘</b><div>CodeWeave<small>STRUCTURE EXPLORER</small></div></div><div className="header-note">{hasWorkspace?'M2-A / SAVED SNAPSHOTS':'LOCAL INDEX / M1'}<span className="live-dot" />{hasWorkspace?<button onClick={() => document.getElementById('workspace-panel')?.scrollIntoView()}>工作区刷新 / 比较</button>:'Read only'}</div></header>
     <div className="workspace"><aside className="sidebar">
       <section><div className="eyebrow">01 / INDEX</div><label htmlFor="index">Snapshot identity</label>
-        <select id="index" value={indexId} onChange={e => setIndexId(e.target.value)}><option value="" disabled>Select an index</option>{indexes.map(i => <option key={i.index_id} value={i.index_id}>{i.created_at} · {i.index_id}</option>)}</select>
+        <select id="index" value={indexId} onChange={e => {focusAction.current?.abort();setFocus(undefined);setIndexId(e.target.value);}}><option value="" disabled>Select an index</option>{indexes.map(i => <option key={i.index_id} value={i.index_id}>{i.source_kind ? i.source_kind+' · ' : ''}{i.created_at} · {i.index_id}</option>)}</select>
         {indexPage !== null && <button className="text-button" disabled={indexLoading} onClick={() => void loadIndexes(indexPage)}>Load older indexes</button>}
         <button className="text-button" onClick={() => void loadIndexes(0)}>Refresh indexes</button>
         {indexLoading && <span role="status">Loading indexes…</span>}
@@ -136,10 +159,11 @@ export default function App() {
         {!nodes.length && <div className="empty-map"><span>↗</span><h1>Follow the code.</h1><p>Search a symbol to open its local call map.<br/>Expand only what you need to read.</p></div>}
         <div className="legend"><span>— direct</span><span>┄ virtual / unresolved</span><span>One edge = one indexed call site</span></div>
       </div>
-      <section className="source-section"><div className="source-heading"><div className="eyebrow">04 / INDEXED SOURCE</div>{source ? <><code>{source.path}:{location.line}:{location.column}</code><small>{source.index_id} · snapshot</small></> : <span>Select a node or call site to inspect its saved source.</span>}</div>
+      <section className="source-section"><div className="source-heading"><div className="eyebrow">04 / INDEXED SOURCE</div>{source ? <><code>{source.path}:{location.line}:{location.column}</code><small>{source.index_id} · snapshot</small>{source.range_sha256 && <small title={`buffer ${source.buffer_sha256} · range ${source.range_sha256}`}>SHA-256 {source.range_sha256.slice(0,16)}</small>}</> : <span>Select a node or call site to inspect its saved source.</span>}</div>
         {source && <SourceBoundary key={`${source.index_id}:${source.path}:${source.start_line}`} content={source.content}><Suspense fallback={<p>Loading source editor…</p>}><SourcePanel source={source} line={location.line} column={location.column}/></Suspense></SourceBoundary>}
         {selected && <div className="call-sites"><strong>{selected.name}</strong><code>{selected.usr}</code>{visible.edges.filter(c => c.source === selected.usr || c.target === selected.usr).map(c => <button key={c.instance_id} onClick={() => void locate(c.file, c.line, c.column_number, c)}>{c.dispatch} · {c.file.split('/').pop()}:{c.line}:{c.column_number}</button>)}<details><summary>Entity / call-site provenance</summary><pre>{JSON.stringify(evidence ?? selected, null, 2)}</pre></details></div>}
       </section>
+      <WorkspacePanel indexes={indexes} onPublished={onPublished} onHighlight={setHighlight} onInspect={onInspect} onConfigured={setHasWorkspace}/>
     </main></div>
   </div>;
 }

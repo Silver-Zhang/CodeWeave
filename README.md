@@ -8,7 +8,77 @@ CodeWeave 的目标是从大型代码仓库自动生成可交互、可查询、�
 
 ## 当前状态
 
-这是仓库初始化后的 M0 版本，已实现 C++ LibTooling → SQLite → JSON CLI 的本地纵向闭环。当前覆盖函数/方法声明与定义、语义 USR 归并、直接调用点、虚调用标记、无法静态解析的函数指针调用以及索引快照读取。M1 增加真实索引驱动的 HTTP API、局部交互图和快照源码面板；尚无工作区增量更新或版本分析；0.0.0 表示未发布；产品目标版本为 v0.1。
+M2-A 本地可用版：Clang LibTooling → 封存输入 → SQLite 不可变索引 → JSON CLI / HTTP → 交互地图。可在编辑器保存修改后手动全量刷新、查询真实进度、比较两次成功索引或 Git HEAD 与工作区，并查看函数、调用关系和源码 Diff。保留 M0/M1 查询能力；尚未实现增量 TU 复用或自动监听。0.0.0 表示未发布。
+
+## 开始使用 M2-A
+
+Linux，Python **3.11+**、Node **22.12+**/npm、Git、CMake、C++ 编译器、匹配的 **LLVM/Clang 18 开发包**和 Bubblewrap（user namespaces 可用）。不自动安装系统软件，不执行被分析项目的构建脚本。
+
+```bash
+# 在 CodeWeave 源码根目录；首次准备 Python 环境
+python3 -m venv .venv
+.venv/bin/python -m pip install -e './backend[dev]'
+# LLVM 前缀内应有 lib/cmake/clang/ClangConfig.cmake
+export CODEWEAVE_LLVM_PREFIX=/path/to/llvm-18
+./scripts/run_local.sh --demo --state-dir /tmp/my-codeweave-demo
+# 浏览器打开 http://127.0.0.1:8000；Ctrl-C 停止服务
+```
+
+启动器只构建 CodeWeave 自身的分析器/前端，首次为自有演示工程真实建库。它打印实际 Python/LLVM/Node、状态目录和地址；缺依赖明确退出。`CODEWEAVE_PYTHON` 可指定已安装依赖的解释器；`--llvm-prefix` / `--resource-dir` 可覆盖探测，`--port` 可换端口。不需要工作流仓库、LLM 或远程服务。
+
+演示工程复制到 **状态目录的 `demo-project/`**，后续启动不会覆盖你的修改。搜索 `choose` / `literal`，点击结果、调用边和源码；编辑该目录 `main.cpp` 中 `return 7;` → `return 9;`、`choose()` 中 `alpha()` → `beta()` 并保存。在网页点“刷新工作区”，等真实 request 状态 `published` 后点“比较上次成功与本次结果”；筛选“调用变化”，点击 `target_changed` 看两侧只读源码 Diff，或“在左/右版地图查看”。原历史地图不会被刷新自动替换。只在文件开头加空行时应仅改变位置证据；改 `config.hpp` 的宏会产生输入上下文变化；临时写入编译错误会显示失败且保留旧索引。
+
+重启复用同一配置和所有已保存索引：
+
+```bash
+./scripts/run_local.sh --state-dir /tmp/my-codeweave-demo
+```
+
+自己的受支持项目必须事先有真实、匹配的编译数据库（CodeWeave 不替你运行项目 CMake/build）：
+
+```bash
+./scripts/run_local.sh --state-dir /tmp/my-project-map \
+  --project-root /absolute/project \
+  --compilation-database /absolute/build/compile_commands.json
+# 需要时重复 --dependency-root /absolute/authorized/headers
+# HEAD 基线配置不在 Git tree 时：--head-compilation-database /absolute/baseline-ccdb.json
+```
+
+状态目录必须在分析输入根之外。已配置状态拒绝偷偷更换项目/工具链，改配置用新状态目录。默认普通 `serve` 继续只读；`open` / 启动器显式启用受约束的工作区刷新。页面不能传入项目路径、数据库位置或编译命令。
+
+“建立 HEAD 基线”读取真实 Git 对象和 tree 内编译数据库或显式基线配置。历史生成输入缺失会阻断 HEAD 侧并显示原因，正常 Workspace 刷新仍可用；不会拿旧索引代替 HEAD。普通 `.git` 目录受支持，linked worktree/alternates/submodule/LFS 历史输入不自动展开。工作区使用实际保存的磁盘字节（包括 staged、unstaged、untracked 和 ignored 文件），不是暂存区或未保存编辑器缓冲。
+
+### M2-A 合同与限制
+
+- 全量重新分析，所有 TU 读取同一套封存副本，在原虚拟路径保持实体身份；精确保存 AST 读取的项目缓冲区。封存是明确字节向量，不是全文件系统原子时刻。封存后磁盘变化不会改旧/新候选 AST，并记录 `workspace_changed_since_capture`。
+- schema **4** 与 protocol **3** 增加快照、配置、attempt、定义范围和唯一 token 上下文证据。新索引、成功指针和 attempt 在单 SQLite 事务发布。失败、取消、进程中断不破坏旧图；重启把已停止的任务标为 interrupted，不自动重跑。
+- 调用关系按 caller/target/dispatch 与实例数量比较，与行号和 instance ID 无关；唯一、同上下文调用才标记 target_changed。宏或重复调用保守显示 ambiguous/unmatched，关系数量仍准确；不猜调用对应，不证明运行时必定执行。
+- 定义字节未变时，输入上下文比较实际 TU 正读集的头/依赖哈希，返回变化路径、前后 SHA-256 和编译 profile 身份；ODRHash 仅作为额外提示。变化详情最多预览8项/8192字节，给出完整数量和集合哈希，原始输入及 TU 关联保留在 SQLite，状态明细可分页查询。它是 TU 级保守提示，不是每个函数的精确依赖或运行时因果。为保留纯移行/其他函数体编辑的独立性，排除定义及 TU 主源码缓冲；同定义文件的外部常量变化可能只出现在文件/源码 Diff，不据“无函数事件”断言行为等价。
+- 源码窗口严格按 UTF-8 显示，返回整文件/窗口 SHA-256 和原始字节范围（`begin` 包含、`end` 不包含）。非 UTF-8 窗口明确报 `source_not_utf8`，原始字节仍保存在索引；已存字节与哈希不符报 `source_integrity_error`，不显示替代字符。双侧源码 Diff 保留相同身份字段。
+- 范围缩小时报告 out_of_scope；声明保留但唯一实现 TU 被移出时报告 definition_removed，带范围原因。源文件未被 ccdb 选择会计入 uncovered；coverage 只保证 selected units，不宣称整个仓库完整。
+- 项目/依赖 symlink、FIFO/device 明确拒绝。标准头/资源及实际 ELF 运行库全部复制和校验；不映射整个 live `/usr`、不执行仓库脚本/hooks/filters，不支持响应文件或插件。授权依赖正文不经 source API 公开。M0 的 legacy `index` 路径仍是 observed-input 身份；使用工作区路径才有封存输入合同。
+- 每输入根最多 **50000** 条目 / **1 GiB**；分析180秒墙钟、120秒CPU、4GiB地址空间、256MiB单输出上限；不保证大型项目性能。Diff beta 每侧50000符号/100000调用实例/32MiB调用锚点；超限明确失败。当前标准头按安装的系统 C++ 搜索顺序封存，不是完整可移植操作系统镜像；特殊目标需匹配显式工具链。
+- 不做自动监听、TU 增量复用、任意历史构建复现、复杂 PCH/modules、完整隐式生命周期或全程序虚分派。`__DATE__` 等按真实分析时刻求值，provenance 记录 epoch，当前所有 TU 均无缓存复用，不承诺确定性构建。
+
+旧 schema3 库只读兼容；显式迁移写入全新路径，旧库字节不变。迁移后的旧索引标为 `legacy_observed_inputs`，可查历史源码但不能伪装为可比较的 protocol3 快照。
+
+```bash
+codeweave migrate --from old.sqlite3 --to new.sqlite3
+codeweave workspace status --state-dir /tmp/my-project-map
+codeweave workspace refresh --state-dir /tmp/my-project-map
+codeweave workspace head --state-dir /tmp/my-project-map
+codeweave query diff --database /tmp/my-project-map/index.sqlite3 --left UUID1 --right UUID2
+codeweave query diff-calls --database /tmp/my-project-map/index.sqlite3 --left UUID1 --right UUID2 --limit 20 --offset 0
+```
+
+整体验收（安装开发依赖与 Chromium 后，包含全新分析器、真实沙箱/CLI、全部后端、M1 浏览器回归和 M2 实际编辑闭环；必需项不允许 Skip）：
+
+```bash
+cd frontend && npm ci && npx playwright install chromium && cd ..
+PYTHON="$PWD/.venv/bin/python" bash scripts/verify_m2.sh
+```
+
+API、错误及明细分块协议见 [HTTP 契约](docs/http-api.md)。以下保留 legacy M0/M1 入口说明。
 
 ## 产品边界
 
@@ -87,7 +157,7 @@ codeweave query status --database index.sqlite --field toolchain --field-offset 
 
 专用验收入口每次创建全新构建目录，输出源码/二进制哈希并运行 A（合成契约）、B（真实 Clang）、C（真实隔离公共 CLI）测试；缺分析器或任何 Skip 均不能通过。需 Bubblewrap/user namespaces 可用，测试还需 C 编译器构建只控制时序的自有探针。构建目录保留以便核验。
 
-`serve` 仅启动 `127.0.0.1:8000` 的健康检查接口，不是可用地图。
+`serve` 默认只读；提供 `--frontend frontend/dist` 才同时提供已构建的地图页面。
 
 初始化尚未生成完整依赖锁文件，不能据此宣称跨机器构建可复现。
 

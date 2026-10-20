@@ -103,13 +103,9 @@ def _schema_identity(connection: sqlite3.Connection) -> list:
     return [tuple(row) for row in connection.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")]
 
 def _validate_schema(connection: sqlite3.Connection) -> None:
-    expected = sqlite3.connect(":memory:")
-    try:
-        expected.executescript(SCHEMA)
-        if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION or _schema_identity(connection) != _schema_identity(expected):
-            raise IndexError("schema_incompatible", "database schema is incompatible; rebuild into a new database path")
-    finally:
-        expected.close()
+    from codeweave.schema import validate
+    validate(connection)
+
 
 def _arguments(entry: dict) -> list[str]:
     args = entry.get("arguments")
@@ -125,7 +121,7 @@ def _trusted_root(path: Path) -> Path:
         raise IndexError("invalid_project_root", "authorize a specific project/dependency directory, not a host-wide root")
     return root
 
-def _safe_arguments(arguments: list[str], source: Path, directory: Path, roots: list[Path]) -> list[str]:
+def _safe_arguments(arguments: list[str], source: Path, directory: Path, roots: list[Path], resolver=None) -> list[str]:
     # LLVM expands leading-@ tokens before interpreting option/value groups.
     # Check the entire original argv, including values and discarded -o operands.
     if any(arg.startswith("@") for arg in arguments):
@@ -136,9 +132,10 @@ def _safe_arguments(arguments: list[str], source: Path, directory: Path, roots: 
     safe = ["/usr/bin/clang++" if "++" in arguments[0] else "/usr/bin/clang"]
     paths = {"-I", "-isystem", "-iquote", "-include", "-imacros"}
     values = {"-D", "-U", "-std", "-x", "-target", "--target"}
+    resolve = resolver or (lambda p: p.resolve())
     def authorized(value: str) -> str:
         candidate = Path(value)
-        physical = (candidate if candidate.is_absolute() else directory / candidate).resolve()
+        physical = resolve(candidate if candidate.is_absolute() else directory / candidate)
         if not any(_inside(physical, root) for root in roots):
             raise IndexError("outside_authorized_roots", "compiler path is outside authorized roots")
         return str(physical)
@@ -169,7 +166,7 @@ def _safe_arguments(arguments: list[str], source: Path, directory: Path, roots: 
             safe.append(arg)
         elif arg in {"-g", "-pthread", "-fPIC", "-fPIE", "-pipe", "-fno-exceptions", "-fno-rtti", "-fexceptions", "-frtti"}:
             safe.append(arg)
-        elif not arg.startswith(("-", "@")) and (directory / arg).resolve() == source:
+        elif not arg.startswith(("-", "@")) and resolve(directory / arg) == source:
             pass
         else:
             raise IndexError("unsafe_compilation_argument", f"rejected compiler argument: {arg}")
@@ -221,12 +218,12 @@ def _sandbox_command(analyzer: Path, database_directory: Path, facts: Path, proj
     args += ["--bind", str(facts.parent), str(facts.parent), "--chdir", str(project_root)]
     return args + [str(analyzer), "--compilation-database", str(database_directory), "--output", str(facts), "--project-root", str(project_root)]
 
-def _collect(records: list, commands: list[dict], project_root: Path) -> tuple:
+def _collect(records: list, commands: list[dict], project_root: Path, fact_schema: int = FACT_SCHEMA_VERSION, allow_empty: bool = False) -> tuple:
     tus = {c["file"] for c in commands}
     files, units, merged, calls = {}, {}, {}, {}
     file_units, symbol_units, call_units = set(), set(), set()
     for r in records:
-        if not isinstance(r, dict) or r.get("schema") != FACT_SCHEMA_VERSION or r.get("tu") not in tus or r.get("type") not in {"file", "unit", "entity", "call"}:
+        if not isinstance(r, dict) or r.get("schema") != fact_schema or r.get("tu") not in tus or r.get("type") not in {"file", "unit", "entity", "call"}:
             raise IndexError("invalid_facts", "unsupported fact version, type or translation unit")
         if r["type"] == "file":
             path, digest = r["path"], r["sha256"]
@@ -283,11 +280,26 @@ def _collect(records: list, commands: list[dict], project_root: Path) -> tuple:
             key = _sha256(_json(identity).encode())
             calls[key] = r
             call_units.add((key, r["tu"]))
-    if not merged:
+    if not merged and not allow_empty:
         raise IndexError("empty_analysis", "analysis produced no entities")
     if any(c["caller_usr"] not in merged for c in calls.values()):
         raise IndexError("invalid_facts", "call has no caller entity")
     return files, units, merged, calls, file_units, symbol_units, call_units
+
+def insert_facts(connection, index_id, commands, collected):
+    files, units, merged, calls, file_units, symbol_units, call_units = collected
+    connection.executemany("INSERT INTO files VALUES (?,?,?,?,?)", [(index_id, path, *value) for path, value in files.items()])
+    connection.executemany("INSERT INTO units VALUES (?,?,?,?,?,?)", [(index_id, c["file"], c["command_sha256"], units[c["file"]]["status"], _json(units[c["file"]]["diagnostics"]), _json({**c, "clang_version": units[c["file"]].get("clang_version")})) for c in commands])
+    connection.executemany("INSERT INTO unit_files VALUES (?,?,?)", [(index_id, *row) for row in sorted(file_units)])
+    for r in merged.values():
+        d, f = r["declaration"], r.get("definition")
+        connection.execute("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?,?,?)", (index_id, r["usr"], r["name"], r["kind"], d["file"], d["line"], d["column"], *(f[k] if f else None for k in ("file", "line", "column")), _json({"declaration": d, "definition": f, "definition_odr": r.get("definition_odr")})))
+    connection.executemany("INSERT INTO symbol_units VALUES (?,?,?)", [(index_id, *row) for row in sorted(symbol_units)])
+    for key, r in calls.items():
+        loc = r["location"]
+        connection.execute("INSERT INTO calls(index_id,instance_id,caller_usr,target_usr,dispatch,file,line,column_number,anchors) VALUES (?,?,?,?,?,?,?,?,?)", (index_id, key, r["caller_usr"], r["target_usr"], r["dispatch"], loc["file"], loc["line"], loc["column"], _json({k: r[k] for k in ("location", "spelling", "expansion_chain")})))
+    connection.executemany("INSERT INTO call_units VALUES (?,?,?)", [(index_id, *row) for row in sorted(call_units)])
+
 
 def build_index(database: Path, compilation_database: Path, analyzer: Path, project_root: Path,
                 dependency_roots: list[Path] | None = None, toolchain_roots: list[Path] | None = None, resource_directory: Path | None = None) -> dict:
@@ -295,6 +307,8 @@ def build_index(database: Path, compilation_database: Path, analyzer: Path, proj
         existing = _connection(database, readonly=True)
         try:
             _validate_schema(existing)
+            if existing.execute("PRAGMA user_version").fetchone()[0] != 3:
+                raise IndexError("schema_incompatible", "use workspace refresh for schema4")
         except sqlite3.Error as error:
             raise IndexError("database_error", "cannot validate index database") from error
         finally:
@@ -348,17 +362,7 @@ def build_index(database: Path, compilation_database: Path, analyzer: Path, proj
             _validate_schema(connection)
         with connection:
             connection.execute("INSERT INTO indexes VALUES (?,CURRENT_TIMESTAMP,?,?,?,?,?,?,?)", (index_id, str(_resolve(compilation_database)), _sha256(raw), str(project_root), "units_complete", result.stderr, SCHEMA_VERSION, _json(toolchain)))
-            connection.executemany("INSERT INTO files VALUES (?,?,?,?,?)", [(index_id, path, *value) for path, value in files.items()])
-            connection.executemany("INSERT INTO units VALUES (?,?,?,?,?,?)", [(index_id, c["file"], c["command_sha256"], units[c["file"]]["status"], _json(units[c["file"]]["diagnostics"]), _json({**c, "clang_version": units[c["file"]].get("clang_version")})) for c in commands])
-            connection.executemany("INSERT INTO unit_files VALUES (?,?,?)", [(index_id, *row) for row in sorted(file_units)])
-            for r in merged.values():
-                d, f = r["declaration"], r.get("definition")
-                connection.execute("INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?,?,?)", (index_id, r["usr"], r["name"], r["kind"], d["file"], d["line"], d["column"], *(f[k] if f else None for k in ("file", "line", "column")), _json({"declaration": d, "definition": f, "definition_odr": r.get("definition_odr")})))
-            connection.executemany("INSERT INTO symbol_units VALUES (?,?,?)", [(index_id, *row) for row in sorted(symbol_units)])
-            for key, r in calls.items():
-                loc = r["location"]
-                connection.execute("INSERT INTO calls(index_id,instance_id,caller_usr,target_usr,dispatch,file,line,column_number,anchors) VALUES (?,?,?,?,?,?,?,?,?)", (index_id, key, r["caller_usr"], r["target_usr"], r["dispatch"], loc["file"], loc["line"], loc["column"], _json({k: r[k] for k in ("location", "spelling", "expansion_chain")})))
-            connection.executemany("INSERT INTO call_units VALUES (?,?,?)", [(index_id, *row) for row in sorted(call_units)])
+            insert_facts(connection, index_id, commands, collected)
         connection.close()
         connection = None
         if temporary:
@@ -373,6 +377,10 @@ def build_index(database: Path, compilation_database: Path, analyzer: Path, proj
     return {"index_id": index_id, "coverage": "units_complete", "entities": len(merged), "calls": len(calls), "call_observations": sum(r["type"] == "call" for r in records), "units": len(units)}
 
 def _index(connection: sqlite3.Connection, index_id: str | None) -> str:
+    if index_id is None and connection.execute("PRAGMA user_version").fetchone()[0] == 4:
+        current = connection.execute("SELECT latest_successful_index FROM workspaces WHERE latest_successful_index IS NOT NULL ORDER BY id LIMIT 1").fetchone()
+        if current:
+            return str(current[0])
     row = connection.execute("SELECT id FROM indexes WHERE id = ?", (index_id,)).fetchone() if index_id else connection.execute("SELECT id FROM indexes ORDER BY rowid DESC LIMIT 1").fetchone()
     if not row:
         raise IndexError("index_not_found", "no matching index")
@@ -398,6 +406,8 @@ def _status(connection: sqlite3.Connection, active: str, limit: int, offset: int
         raise IndexError("invalid_arguments", "status details must be units or inputs")
     if field:
         allowed = {None: {"toolchain"}, "units": {"command", "diagnostics", "source_file"}, "inputs": {"path"}}
+        if connection.execute('PRAGMA user_version').fetchone()[0]==4:
+            allowed[None].update({'provenance','manifest'})
         if field not in allowed[details] or (details and limit != 1):
             raise IndexError("invalid_arguments", "field must match status details; select one detail with --limit 1")
         if details:
@@ -406,7 +416,12 @@ def _status(connection: sqlite3.Connection, active: str, limit: int, offset: int
         else:
             if offset:
                 raise IndexError("invalid_arguments", "toolchain field does not have a row offset")
-            row = connection.execute("SELECT toolchain FROM indexes WHERE id=?", (active,)).fetchone()
+            if field=='provenance':
+                row=connection.execute('SELECT provenance FROM index_metadata WHERE index_id=?',(active,)).fetchone()
+            elif field=='manifest':
+                row=connection.execute('SELECT s.manifest FROM snapshots s JOIN index_metadata m ON m.snapshot_id=s.id WHERE m.index_id=?',(active,)).fetchone()
+            else:
+                row = connection.execute("SELECT toolchain FROM indexes WHERE id=?", (active,)).fetchone()
         if row is None:
             raise IndexError("status_item_not_found", "no status item at the requested offset")
         raw = row[0].encode("utf-8")
@@ -455,6 +470,14 @@ def _status(connection: sqlite3.Connection, active: str, limit: int, offset: int
                     "unit_count": connection.execute("SELECT count(*) FROM units WHERE index_id=?", (active,)).fetchone()[0],
                     "input_count": connection.execute("SELECT count(*) FROM files WHERE index_id=?", (active,)).fetchone()[0],
                     "diagnostic_summary": diagnostic_summary, "limitations": COVERAGE_LIMITS}
+        if connection.execute('PRAGMA user_version').fetchone()[0] == 4:
+            meta = connection.execute('SELECT snapshot_id,profile_id,source_kind,provenance FROM index_metadata WHERE index_id=?',(active,)).fetchone()
+            if meta:
+                provenance=json.loads(meta['provenance'])
+                response.update(snapshot_id=meta['snapshot_id'],profile_id=meta['profile_id'],source_kind=meta['source_kind'],
+                                base_git_head=provenance.get('base_git_head'),represented_git_commit=provenance.get('represented_git_commit'),
+                                previous_index_id=provenance.get('previous_index_id'),uncovered_file_count=len(provenance.get('uncovered_files',[])),
+                                workspace_changed_since_capture=provenance.get('workspace_changed_since_capture'))
     if _status_size(response) > MAX_STATUS_BYTES:
         raise IndexError("status_limit", "status response exceeds the serialized JSON budget")
     return response
@@ -485,7 +508,10 @@ def _query(database: Path, command: str, value: str | None = None, index_id: str
             raise IndexError("missing_argument", f"{command} requires a value")
         total = None
         if command == "indexes":
-            rows = connection.execute("SELECT id AS index_id,created_at,coverage,schema_version FROM indexes ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit + 1, offset)).fetchall()
+            if connection.execute('PRAGMA user_version').fetchone()[0] == 4:
+                rows=connection.execute('SELECT i.id AS index_id,i.created_at,i.coverage,i.schema_version,m.source_kind,m.snapshot_id,m.profile_id FROM indexes i LEFT JOIN index_metadata m ON m.index_id=i.id ORDER BY i.rowid DESC LIMIT ? OFFSET ?',(limit+1,offset)).fetchall()
+            else:
+                rows = connection.execute("SELECT id AS index_id,created_at,coverage,schema_version FROM indexes ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit + 1, offset)).fetchall()
             total = connection.execute("SELECT count(*) FROM indexes").fetchone()[0]
         elif command == "search":
             rows = connection.execute("SELECT * FROM symbols WHERE index_id = ? AND name LIKE ? ORDER BY name, usr LIMIT ? OFFSET ?", (active, f"%{value or ''}%", limit + 1, offset)).fetchall()
@@ -501,10 +527,13 @@ def _query(database: Path, command: str, value: str | None = None, index_id: str
                 raise IndexError("invalid_range", "source requires a valid inclusive line range")
             if end_line - start_line + 1 > MAX_SOURCE_LINES:
                 raise IndexError("source_limit", f"source range exceeds {MAX_SOURCE_LINES} lines")
-            row = connection.execute("SELECT content FROM files WHERE index_id = ? AND path = ?", (active, value)).fetchone()
+            row = connection.execute("SELECT content,sha256 FROM files WHERE index_id = ? AND path = ?", (active, value)).fetchone()
             if not row or row["content"] is None:
                 raise IndexError("source_not_registered", "path is not registered in this index")
-            lines = bytes(row["content"]).splitlines(keepends=True)
+            buffer = bytes(row['content'])
+            if _sha256(buffer) != row['sha256']:
+                raise IndexError('source_integrity_error', 'indexed source bytes do not match their stored SHA-256')
+            lines = buffer.splitlines(keepends=True)
             if clamp_end:
                 end_line = min(end_line, len(lines))
             if start_line > len(lines):
@@ -514,7 +543,14 @@ def _query(database: Path, command: str, value: str | None = None, index_id: str
             content = b"".join(lines[start_line - 1:end_line])
             if len(content) > MAX_SOURCE_BYTES:
                 raise IndexError("source_limit", f"source range exceeds {MAX_SOURCE_BYTES} bytes")
-            return {"index_id": active, "path": value, "start_line": start_line, "end_line": end_line, "content": content.decode("utf-8", errors="replace")}
+            try:
+                text = content.decode('utf-8')
+            except UnicodeDecodeError as error:
+                raise IndexError('source_not_utf8', 'indexed source window is not valid UTF-8; raw bytes remain preserved in the index') from error
+            begin = sum(map(len, lines[:start_line - 1]))
+            return {"index_id": active, "path": value, "start_line": start_line, "end_line": end_line,
+                    "content": text, 'encoding': 'utf-8', 'sha256': row['sha256'], 'buffer_sha256': row['sha256'],
+                    'range_sha256': _sha256(content), 'begin': begin, 'end': begin + len(content)}
         else:
             raise IndexError("unknown_query", "unknown query command")
         items = [dict(row) for row in rows[:limit]]
@@ -522,10 +558,16 @@ def _query(database: Path, command: str, value: str | None = None, index_id: str
             for item in items:
                 item["anchors"] = json.loads(item["anchors"])
                 item["units"] = [r[0] for r in connection.execute("SELECT source_file FROM symbol_units WHERE index_id=? AND usr=? ORDER BY source_file", (active, item["usr"]))]
+                if connection.execute('PRAGMA user_version').fetchone()[0]==4:
+                    evidence=connection.execute('SELECT evidence FROM symbol_evidence WHERE index_id=? AND usr=?',(active,item['usr'])).fetchone()
+                    item['evidence']=json.loads(evidence[0]) if evidence else None
         if command in {"callers", "callees"}:
             for item in items:
                 item["anchors"] = json.loads(item["anchors"])
                 item["units"] = [r[0] for r in connection.execute("SELECT source_file FROM call_units WHERE index_id=? AND instance_id=? ORDER BY source_file", (active, item["instance_id"]))]
+                if connection.execute('PRAGMA user_version').fetchone()[0]==4:
+                    evidence=connection.execute('SELECT evidence FROM call_evidence WHERE index_id=? AND instance_id=?',(active,item['instance_id'])).fetchone()
+                    item['syntax']=json.loads(evidence[0]) if evidence else None
         result = {"index_id": active, "items": items, "truncated": len(rows) > limit}
         if total is not None:
             remaining = max(0, total - offset - len(items))

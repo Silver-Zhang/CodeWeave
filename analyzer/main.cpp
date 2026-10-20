@@ -1,11 +1,13 @@
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ODRHash.h>
+#include <clang/AST/Mangle.h>
 #include <clang/Basic/Version.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Index/USRGeneration.h>
 #include <clang/Lex/Preprocessor.h>
+#include <clang/Lex/Lexer.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/SHA256.h>
 #include <llvm/ADT/StringExtras.h>
@@ -17,8 +19,10 @@
 #include <cstdio>
 #include <fstream>
 #include <optional>
+#include <memory>
 #include <string>
 #include <vector>
+#include <set>
 
 namespace {
 
@@ -30,6 +34,7 @@ llvm::cl::opt<std::string> OutputPath("output", llvm::cl::desc("JSONL output pat
                                       llvm::cl::Required, llvm::cl::cat(Category));
 llvm::cl::opt<std::string> ProjectRoot("project-root", llvm::cl::desc("Allowed physical source root"),
                                        llvm::cl::Required, llvm::cl::cat(Category));
+llvm::cl::opt<unsigned> FactProtocol("fact-protocol", llvm::cl::init(2), llvm::cl::cat(Category));
 
 std::string escapeJson(llvm::StringRef value) {
   std::string out;
@@ -81,6 +86,7 @@ std::string digest(llvm::StringRef content) {
   return llvm::toHex(llvm::ArrayRef<uint8_t>(hash), true);
 }
 std::string currentTU;
+std::unique_ptr<clang::MangleContext> currentMangler;
 std::string canonicalPath(llvm::StringRef path) {
   llvm::SmallString<256> real;
   if (llvm::sys::fs::real_path(path, real)) return std::string(path);
@@ -88,7 +94,25 @@ std::string canonicalPath(llvm::StringRef path) {
 }
 
 std::string identityFor(const clang::FunctionDecl *decl, clang::SourceManager &sourceManager) {
-  const auto usr = usrFor(decl).value_or(std::string());
+  auto usr = usrFor(decl).value_or(std::string());
+  // Clang USRs encode a closure's physical source offset. Its compiler ABI
+  // identity is scoped to the enclosing declaration and survives line moves.
+  // Keep legacy protocol2 unchanged; do not correlate anonymous sites by name.
+  if (FactProtocol == 3 && currentMangler) {
+    if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl)) {
+      if (method->getParent()->isLambda() || method->getParent()->isLocalClass()) {
+        std::string mangled;
+        llvm::raw_string_ostream stream(mangled);
+        if (const auto *constructor = llvm::dyn_cast<clang::CXXConstructorDecl>(decl))
+          currentMangler->mangleName(clang::GlobalDecl(constructor, clang::Ctor_Complete), stream);
+        else if (const auto *destructor = llvm::dyn_cast<clang::CXXDestructorDecl>(decl))
+          currentMangler->mangleName(clang::GlobalDecl(destructor, clang::Dtor_Complete), stream);
+        else currentMangler->mangleName(clang::GlobalDecl(decl), stream);
+        stream.flush();
+        usr = "c:local-abi:" + mangled;
+      }
+    }
+  }
   bool localToTU = !decl->hasExternalFormalLinkage();
   // A closure/local class inside an external inline function has the enclosing
   // function's ODR identity, even though its method has no formal linkage.
@@ -103,17 +127,67 @@ std::string identityFor(const clang::FunctionDecl *decl, clang::SourceManager &s
   return usr;
 }
 
+std::optional<unsigned> calleeOffset(const clang::CallExpr *call, clang::SourceManager &sm) {
+  auto *expr = call->getCallee()->IgnoreParenImpCasts();
+  clang::SourceLocation loc;
+  if (auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(expr)) loc = ref->getLocation();
+  if (auto *member = llvm::dyn_cast<clang::MemberExpr>(expr)) loc = member->getMemberLoc();
+  if (loc.isInvalid() || loc.isMacroID()) return std::nullopt;
+  return sm.getFileOffset(loc);
+}
+
+class CalleeOffsets : public clang::RecursiveASTVisitor<CalleeOffsets> {
+public:
+  clang::SourceManager &sm;
+  std::set<unsigned> offsets;
+  explicit CalleeOffsets(clang::SourceManager &manager) : sm(manager) {}
+  bool VisitCallExpr(clang::CallExpr *call) {
+    if (auto offset = calleeOffset(call, sm)) offsets.insert(*offset);
+    return true;
+  }
+};
+
+std::string rangeJson(clang::SourceRange range, clang::ASTContext &context,
+                      const std::set<unsigned> &mask = {}) {
+  auto &sm = context.getSourceManager();
+  auto begin = range.getBegin(), end = range.getEnd();
+  if (begin.isInvalid() || end.isInvalid() || begin.isMacroID() || end.isMacroID()) return "null";
+  if (!allowedPath(physicalPath(begin, sm))) return "null";
+  end = clang::Lexer::getLocForEndOfToken(end, 0, sm, context.getLangOpts());
+  if (end.isInvalid() || sm.getFileID(begin) != sm.getFileID(end)) return "null";
+  unsigned start = sm.getFileOffset(begin), stop = sm.getFileOffset(end);
+  auto buffer = sm.getBufferData(sm.getFileID(begin));
+  if (stop < start || stop > buffer.size()) return "null";
+  std::string tokens;
+  auto loc = begin;
+  while (sm.getFileOffset(loc) < stop) {
+    clang::Token token;
+    if (clang::Lexer::getRawToken(loc, token, sm, context.getLangOpts(), true)) break;
+    auto offset = sm.getFileOffset(token.getLocation());
+    if (offset >= stop || !token.getLength()) break;
+    if (!token.is(clang::tok::comment)) {
+      auto spelling = mask.count(offset) ? "@callee" : clang::Lexer::getSpelling(token, sm, context.getLangOpts());
+      tokens += std::to_string(spelling.size()) + ":" + spelling + ";";
+    }
+    loc = token.getLocation().getLocWithOffset(token.getLength());
+  }
+  return "{\"file\":" + quoted(physicalPath(begin, sm)) + ",\"begin\":" + std::to_string(start) +
+      ",\"end\":" + std::to_string(stop) + ",\"sha256\":" + quoted(digest(buffer.slice(start, stop))) +
+      ",\"buffer_sha256\":" + quoted(digest(buffer)) + ",\"token_sha256\":" + quoted(digest(tokens)) + "}";
+}
+
 class Emitter {
 public:
   explicit Emitter(std::ostream &out) : out_(out) {}
 
   void file(llvm::StringRef path, llvm::StringRef content) {
-    out_ << "{\"schema\":2,\"type\":\"file\",\"tu\":" << quoted(currentTU)
+    out_ << "{\"schema\":" << FactProtocol << ",\"type\":\"file\",\"tu\":" << quoted(currentTU)
          << ",\"path\":" << quoted(path) << ",\"sha256\":" << quoted(digest(content))
          << ",\"content_hex\":" << (allowedPath(path) ? quoted(llvm::toHex(content)) : "null") << "}\n";
   }
 
-  void entity(const clang::FunctionDecl *decl, clang::SourceManager &sourceManager) {
+  void entity(const clang::FunctionDecl *decl, clang::ASTContext &context) {
+    auto &sourceManager = context.getSourceManager();
     const auto usr = usrFor(decl);
     if (!usr) return;
     const auto identity = identityFor(decl, sourceManager);
@@ -121,7 +195,7 @@ public:
     const auto location = sourceManager.getSpellingLoc(canonical->getLocation());
     const auto file = physicalPath(location, sourceManager);
     if (file.empty() || !allowedPath(file)) return;
-    out_ << "{\"schema\":2,\"type\":\"entity\",\"tu\":" << quoted(currentTU) << ",\"usr\":" << quoted(identity)
+    out_ << "{\"schema\":" << FactProtocol << ",\"type\":\"entity\",\"tu\":" << quoted(currentTU) << ",\"usr\":" << quoted(identity)
          << ",\"semantic_usr\":" << quoted(*usr)
          << ",\"name\":" << quoted(canonical->getQualifiedNameAsString())
          << ",\"kind\":" << quoted(canonical->isCXXClassMember() ? "method" : "function")
@@ -142,11 +216,21 @@ public:
       hash.AddFunctionDecl(definition);
       out_ << hash.CalculateHash();
     } else out_ << "null";
+    if (FactProtocol == 3) {
+      const auto *definition = canonical->getDefinition();
+      CalleeOffsets masks(sourceManager);
+      if (definition && definition->hasBody()) masks.TraverseStmt(definition->getBody());
+      out_ << ",\"linkage\":" << quoted(decl->hasExternalFormalLinkage() ? "external" : "internal")
+           << ",\"owner_tu\":" << quoted(currentTU)
+           << ",\"definition_range\":" << (definition ? rangeJson(definition->getSourceRange(), context) : "null")
+           << ",\"normalized_definition\":" << (definition ? rangeJson(definition->getSourceRange(), context, masks.offsets) : "null");
+    }
     out_ << "}\n";
   }
 
   void call(const clang::CallExpr *call, const clang::FunctionDecl *caller,
-            clang::SourceManager &sourceManager) {
+            clang::ASTContext &context) {
+    auto &sourceManager = context.getSourceManager();
     const auto location = sourceManager.getExpansionLoc(call->getExprLoc());
     const auto physical = physicalPath(location, sourceManager);
     if (physical.empty() || !allowedPath(physical)) return;
@@ -162,7 +246,7 @@ public:
         }
       }
     }
-    out_ << "{\"schema\":2,\"type\":\"call\",\"tu\":" << quoted(currentTU) << ",\"caller_usr\":" << quoted(identityFor(caller, sourceManager));
+    out_ << "{\"schema\":" << FactProtocol << ",\"type\":\"call\",\"tu\":" << quoted(currentTU) << ",\"caller_usr\":" << quoted(identityFor(caller, sourceManager));
     out_ << ",\"target_usr\":";
     if (callee) out_ << quoted(identityFor(callee, sourceManager)); else out_ << "null";
     out_ << ",\"dispatch\":" << quoted(dispatch)
@@ -179,7 +263,13 @@ public:
            << "," << locationJson(sourceManager.getSpellingLoc(range.getEnd()), sourceManager) << "]";
       macro = sourceManager.getImmediateMacroCallerLoc(macro);
     }
-    out_ << "]}\n";
+    out_ << "]";
+    if (FactProtocol == 3) {
+      std::set<unsigned> masks;
+      if (auto offset = calleeOffset(call, sourceManager)) masks.insert(*offset);
+      out_ << ",\"syntax\":" << (masks.empty() ? "null" : rangeJson(call->getSourceRange(), context, masks));
+    }
+    out_ << "}\n";
   }
 
 private:
@@ -220,15 +310,15 @@ public:
   bool VisitFunctionDecl(clang::FunctionDecl *decl) {
     const auto path = physicalPath(decl->getLocation(), context_.getSourceManager());
     if (!allowedPath(path)) return true;
-    emitter_.entity(decl, context_.getSourceManager());
+    emitter_.entity(decl, context_);
     return true;
   }
   bool VisitCallExpr(clang::CallExpr *call) {
     const auto path = physicalPath(call->getExprLoc(), context_.getSourceManager());
     if (!allowedPath(path)) return true;
     if (!functionStack_.empty()) {
-      if (const auto *target = call->getDirectCallee()) emitter_.entity(target, context_.getSourceManager());
-      emitter_.call(call, functionStack_.back(), context_.getSourceManager());
+      if (const auto *target = call->getDirectCallee()) emitter_.entity(target, context_);
+      emitter_.call(call, functionStack_.back(), context_);
     }
     return true;
   }
@@ -242,8 +332,10 @@ class Consumer : public clang::ASTConsumer {
 public:
   explicit Consumer(Emitter &emitter) : emitter_(emitter) {}
   void HandleTranslationUnit(clang::ASTContext &context) override {
+    currentMangler.reset(context.createMangleContext());
     Visitor visitor(context, emitter_);
     visitor.TraverseDecl(context.getTranslationUnitDecl());
+    currentMangler.reset();
   }
 private:
   Emitter &emitter_;
@@ -300,6 +392,7 @@ public:
 int main(int argc, const char **argv) {
   llvm::cl::HideUnrelatedOptions(Category);
   llvm::cl::ParseCommandLineOptions(argc, argv, "CodeWeave Clang source analyzer\n");
+  if (FactProtocol != 2 && FactProtocol != 3) return 2;
   std::string error;
   auto database = clang::tooling::CompilationDatabase::loadFromDirectory(CompilationDatabasePath, error);
   if (!database) {
@@ -324,7 +417,7 @@ int main(int argc, const char **argv) {
     const int unitResult = tool.run(&factory);
     const bool failed = unitResult != 0 || diagnostics.failed;
     result |= failed;
-    output << "{\"schema\":2,\"type\":\"unit\",\"tu\":" << quoted(currentTU)
+    output << "{\"schema\":" << FactProtocol << ",\"type\":\"unit\",\"tu\":" << quoted(currentTU)
            << ",\"clang_version\":" << quoted(CLANG_VERSION_STRING)
            << ",\"status\":" << quoted(failed ? "failed" : "complete") << ",\"diagnostics\":[";
     for (size_t i = 0; i < diagnostics.records.size(); ++i) {
